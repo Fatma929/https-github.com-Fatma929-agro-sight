@@ -1,23 +1,41 @@
+import base64
+import hashlib
+import hmac
 import json
 import math
 import os
 import shutil
+import struct
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from app import (
+    AUTHORITATIVE_FIREBASE_PROJECT_ID,
+     ApiHttpError,
+    DEFAULT_TRUSTED_RSA_KEYPAIR,
+    FirebaseAdminAuthenticator,
     SatelliteBackendService,
+    UNTRUSTED_ATTACKER_RSA_KEYPAIR,
     create_http_server,
     create_signed_test_firebase_token,
+    verify_firebase_bearer_token,
 )
 from raster_service import (
     GeoTiffCogProcessor,
     GeoTransform,
+    InvalidAssetUrlError,
+    MissingBandError,
+    RangeRequestNotSupportedError,
     RasterBandData,
+    RasterDownloadInterruptedError,
+    RasterIntegrityError,
+    RemoteCogHttpClient,
+    UnsupportedCrsError,
     aggregate_field_raster,
     align_band_to_target_grid,
     analyze_temporal_observations,
@@ -31,8 +49,10 @@ from raster_service import (
     safe_normalized_difference,
     safe_psri,
     utm_to_wgs84,
+    validate_supported_crs,
     wgs84_to_utm,
 )
+
 
 
 class TestSentinel2OperationalRasterPipeline(unittest.TestCase):
@@ -490,6 +510,549 @@ class TestSentinel2OperationalRasterPipeline(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_firebase_rs256_authentication_and_token_rejection_suite(self):
+        """
+        PRIORITY 1 Security Acceptance Suite:
+        1. Valid Firebase RS256 token is accepted.
+        2. Invalid signature (tampered payload/signature) is rejected.
+        3. Forged RS256 token signed with attacker's 2048-bit RSA key is rejected.
+        4. Forged HS256 token is rejected.
+        5. Expired token is rejected.
+        6. Token from another Firebase project is rejected.
+        7. Token with incorrect audience is rejected.
+        8. Token with invalid issuer is rejected.
+        9. Revoked token is rejected.
+        """
+        authenticator = FirebaseAdminAuthenticator(
+            project_id=AUTHORITATIVE_FIREBASE_PROJECT_ID,
+            trusted_public_keys={DEFAULT_TRUSTED_RSA_KEYPAIR.kid: DEFAULT_TRUSTED_RSA_KEYPAIR},
+            use_firebase_admin_sdk=False,
+        )
+
+        # 1. Valid Firebase RS256 token is accepted
+        valid_token = create_signed_test_firebase_token(
+            uid="farmer_verified_01",
+            email="farmer01@agrosight.eg",
+            email_verified=True,
+        )
+        claims = authenticator.verify_bearer_header(f"Bearer {valid_token}")
+        self.assertEqual(claims["uid"], "farmer_verified_01")
+        self.assertEqual(claims["role"], "FARMER")
+        self.assertEqual(claims["project_id"], AUTHORITATIVE_FIREBASE_PROJECT_ID)
+
+        # 2. Invalid signature (tampered payload with original RS256 signature) is rejected
+        parts = valid_token.split(".")
+        tampered_payload = json.dumps({
+            "iss": f"https://securetoken.google.com/{AUTHORITATIVE_FIREBASE_PROJECT_ID}",
+            "aud": AUTHORITATIVE_FIREBASE_PROJECT_ID,
+            "sub": "impersonated_admin_uid",
+            "user_id": "impersonated_admin_uid",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 3600,
+        }).encode("utf-8")
+        tampered_p_enc = base64.urlsafe_b64encode(tampered_payload).decode("ascii").rstrip("=")
+        tampered_token = f"{parts[0]}.{tampered_p_enc}.{parts[2]}"
+        with self.assertRaises(ApiHttpError) as ctx_sig:
+            authenticator.verify_bearer_header(f"Bearer {tampered_token}")
+        self.assertEqual(ctx_sig.exception.status_code, 401)
+        self.assertEqual(ctx_sig.exception.error_code, "INVALID_TOKEN_SIGNATURE")
+
+        # 3. Forged RS256 token signed with attacker's 2048-bit RSA key is rejected
+        forged_rs256_token = create_signed_test_firebase_token(
+            uid="attacker_uid",
+            email="attacker@evil.org",
+            rsa_keypair=UNTRUSTED_ATTACKER_RSA_KEYPAIR,
+        )
+        with self.assertRaises(ApiHttpError) as ctx_forged_rs256:
+            authenticator.verify_bearer_header(f"Bearer {forged_rs256_token}")
+        self.assertEqual(ctx_forged_rs256.exception.status_code, 401)
+        self.assertEqual(ctx_forged_rs256.exception.error_code, "INVALID_TOKEN_SIGNATURE")
+
+        # 4. Forged HS256 token (even if signed with old default secret) is rejected
+        hs_header = base64.urlsafe_b64encode(
+            json.dumps({"alg": "HS256", "typ": "JWT", "kid": DEFAULT_TRUSTED_RSA_KEYPAIR.kid}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        hs_payload = base64.urlsafe_b64encode(
+            json.dumps({
+                "iss": f"https://securetoken.google.com/{AUTHORITATIVE_FIREBASE_PROJECT_ID}",
+                "aud": AUTHORITATIVE_FIREBASE_PROJECT_ID,
+                "sub": "attacker_hs256",
+                "iat": int(time.time()),
+                "exp": int(time.time()) + 3600,
+            }).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        hs_sig = base64.urlsafe_b64encode(
+            hmac.new(b"agrosight-firebase-verifier-key", f"{hs_header}.{hs_payload}".encode("ascii"), hashlib.sha256).digest()
+        ).decode("ascii").rstrip("=")
+        forged_hs256_token = f"{hs_header}.{hs_payload}.{hs_sig}"
+        with self.assertRaises(ApiHttpError) as ctx_hs256:
+            authenticator.verify_bearer_header(f"Bearer {forged_hs256_token}")
+        self.assertEqual(ctx_hs256.exception.status_code, 401)
+        self.assertEqual(ctx_hs256.exception.error_code, "UNSUPPORTED_TOKEN_ALG")
+
+        # 5. Expired token is rejected
+        expired_token = create_signed_test_firebase_token(
+            uid="farmer_verified_01",
+            iat_epoch_sec=int(time.time()) - 7200,
+            exp_epoch_sec=int(time.time()) - 30,
+        )
+        with self.assertRaises(ApiHttpError) as ctx_exp:
+            authenticator.verify_bearer_header(f"Bearer {expired_token}")
+        self.assertEqual(ctx_exp.exception.status_code, 401)
+        self.assertEqual(ctx_exp.exception.error_code, "TOKEN_EXPIRED")
+
+        # 6. Token from another Firebase project is rejected
+        other_project_token = create_signed_test_firebase_token(
+            uid="farmer_other_proj",
+            project_id="another-firebase-project-999",
+        )
+        with self.assertRaises(ApiHttpError) as ctx_proj:
+            authenticator.verify_bearer_header(f"Bearer {other_project_token}")
+        self.assertEqual(ctx_proj.exception.status_code, 401)
+        self.assertEqual(ctx_proj.exception.error_code, "INVALID_AUDIENCE")
+
+        # 7. Token with incorrect audience is rejected
+        wrong_aud_token = create_signed_test_firebase_token(
+            uid="farmer_verified_01",
+            aud="wrong-client-audience-id",
+        )
+        with self.assertRaises(ApiHttpError) as ctx_aud:
+            authenticator.verify_bearer_header(f"Bearer {wrong_aud_token}")
+        self.assertEqual(ctx_aud.exception.status_code, 401)
+        self.assertEqual(ctx_aud.exception.error_code, "INVALID_AUDIENCE")
+
+        # 8. Token with invalid issuer is rejected
+        wrong_iss_token = create_signed_test_firebase_token(
+            uid="farmer_verified_01",
+            iss=f"https://forged-issuer.example.com/{AUTHORITATIVE_FIREBASE_PROJECT_ID}",
+        )
+        with self.assertRaises(ApiHttpError) as ctx_iss:
+            authenticator.verify_bearer_header(f"Bearer {wrong_iss_token}")
+        self.assertEqual(ctx_iss.exception.status_code, 401)
+        self.assertEqual(ctx_iss.exception.error_code, "INVALID_ISSUER")
+
+        # 9. Revoked token is rejected (both by token/jti and by user refresh token revocation)
+        revocable_token = create_signed_test_firebase_token(
+            uid="farmer_revoked_uid",
+            jti="jti_to_revoke_123",
+        )
+        # Valid before revocation
+        self.assertEqual(authenticator.verify_bearer_header(f"Bearer {revocable_token}")["uid"], "farmer_revoked_uid")
+        authenticator.revoke_token_id("jti_to_revoke_123")
+        with self.assertRaises(ApiHttpError) as ctx_rev1:
+            authenticator.verify_bearer_header(f"Bearer {revocable_token}")
+        self.assertEqual(ctx_rev1.exception.status_code, 401)
+        self.assertEqual(ctx_rev1.exception.error_code, "TOKEN_REVOKED")
+
+        # User-level refresh token revocation
+        uid_token = create_signed_test_firebase_token(
+            uid="farmer_session_revoked",
+            iat_epoch_sec=int(time.time()) - 10,
+        )
+        authenticator.revoke_refresh_tokens("farmer_session_revoked", revoked_at_epoch=int(time.time()))
+        with self.assertRaises(ApiHttpError) as ctx_rev2:
+            authenticator.verify_bearer_header(f"Bearer {uid_token}")
+        self.assertEqual(ctx_rev2.exception.status_code, 401)
+        self.assertEqual(ctx_rev2.exception.error_code, "TOKEN_REVOKED")
+
+    def test_zero_trust_rbac_and_uid_impersonation_prevention(self):
+        """
+        PRIORITY 1 Zero-Trust RBAC Acceptance Suite:
+        1. Unverified JWT top-level 'role' claim is never trusted for admin elevation.
+        2. Farmer cannot access administrator endpoints (403).
+        3. Agronomist (AGRONOMIST_ADMIN) can view admin overview (200) but cannot perform
+           Super Administrator operations (403).
+        4. Super Administrator (SUPER_ADMIN) can perform role assignment and job deletion (200).
+        5. User cannot impersonate another UID in request bodies (403 UID_IMPERSONATION_FORBIDDEN).
+        """
+        service = SatelliteBackendService(
+            storage_root=os.path.join(self.temp_dir, "rbac_storage"),
+        )
+        server, _ = create_http_server(service=service, host="127.0.0.1", port=0)
+        port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        try:
+            base_url = f"http://127.0.0.1:{port}"
+
+            def _http(method: str, path: str, token: str, payload: dict = None):
+                headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+                data = json.dumps(payload).encode("utf-8") if payload is not None else None
+                req = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        return resp.getcode(), json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read().decode("utf-8"))
+
+            # Token with unverified top-level payload["role"] = "SUPER_ADMIN" (no verified custom claims)
+            self_claimed_admin_token = create_signed_test_firebase_token(
+                uid="farmer_sneaky",
+                email="sneaky@example.com",
+                unverified_payload_role="SUPER_ADMIN",
+            )
+            agronomist_token = create_signed_test_firebase_token(
+                uid="agronomist_01",
+                email="agro@agrosight.eg",
+                role="AGRONOMIST_ADMIN",
+            )
+            super_admin_token = create_signed_test_firebase_token(
+                uid="super_admin_01",
+                email="elzahraafatma288@gmail.com",
+                email_verified=True,
+            )
+
+            # 1 & 2. Farmer (even with unverified top-level payload role="SUPER_ADMIN") is blocked from admin endpoints
+            code_farmer_ov, err_farmer_ov = _http("GET", "/api/v1/admin/overview", token=self_claimed_admin_token)
+            self.assertEqual(code_farmer_ov, 403)
+            self.assertEqual(err_farmer_ov["error_code"], "FORBIDDEN_ADMIN_ENDPOINT")
+
+            code_farmer_roles, err_farmer_roles = _http(
+                "POST",
+                "/api/v1/admin/roles",
+                token=self_claimed_admin_token,
+                payload={"target_uid": "farmer_sneaky", "role": "SUPER_ADMIN"},
+            )
+            self.assertEqual(code_farmer_roles, 403)
+            self.assertEqual(err_farmer_roles["error_code"], "FORBIDDEN_SUPER_ADMIN_ONLY")
+
+            # 3. Agronomist CAN view admin overview (200) but CANNOT assign roles (403)
+            code_agro_ov, agro_ov = _http("GET", "/api/v1/admin/overview", token=agronomist_token)
+            self.assertEqual(code_agro_ov, 200)
+            self.assertEqual(agro_ov["admin_role"], "AGRONOMIST_ADMIN")
+
+            code_agro_roles, err_agro_roles = _http(
+                "POST",
+                "/api/v1/admin/roles",
+                token=agronomist_token,
+                payload={"target_uid": "agronomist_01", "role": "SUPER_ADMIN"},
+            )
+            self.assertEqual(code_agro_roles, 403)
+            self.assertEqual(err_agro_roles["error_code"], "FORBIDDEN_SUPER_ADMIN_ONLY")
+
+            # 4. Super Admin CAN assign verified custom claims roles (200)
+            code_sa_roles, sa_roles = _http(
+                "POST",
+                "/api/v1/admin/roles",
+                token=super_admin_token,
+                payload={"target_uid": "promoted_agronomist_uid", "role": "AGRONOMIST_ADMIN"},
+            )
+            self.assertEqual(code_sa_roles, 200)
+            self.assertEqual(sa_roles["assigned_role"], "AGRONOMIST_ADMIN")
+
+            # 5. UID Impersonation prevention: farmer_sneaky cannot submit a request with owner_uid="victim_farmer_uid"
+            farm_poly = {
+                "type": "Polygon",
+                "coordinates": [[
+                    [30.3500, 30.3800],
+                    [30.3510, 30.3800],
+                    [30.3510, 30.3810],
+                    [30.3500, 30.3810],
+                    [30.3500, 30.3800],
+                ]],
+            }
+            code_impersonate, err_imp = _http(
+                "POST",
+                "/api/v1/satellite/scenes",
+                token=self_claimed_admin_token,
+                payload={
+                    "farm_id": "new_unregistered_farm_99",
+                    "owner_uid": "victim_farmer_uid",
+                    "farm_polygon_geojson": farm_poly,
+                },
+            )
+            self.assertEqual(code_impersonate, 403)
+            self.assertEqual(err_imp["error_code"], "UID_IMPERSONATION_FORBIDDEN")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_remote_cog_http_range_windowed_tiles_and_overviews(self):
+        """
+        PRIORITY 2 Remote COG & Windowed Tile Access Suite (Cases 1, 2, 3, 7):
+        - Creates a large 128x128 tiled Cloud-Optimized GeoTIFF (tile_width=16, tile_height=16 => 64 tiles)
+          with a 2x overview pyramid IFD (64x64) in EPSG:32636.
+        - Serves the COG over an HTTP server supporting RFC 7233 Range requests (206 Partial Content).
+        - Queries a small farm polygon covering only the top-left corner of the scene.
+        - Verifies that ONLY the header/IFD and the intersecting tiles are fetched via HTTP Range
+          requests (without downloading the entire file).
+        - Verifies reading the remote overview IFD (overview_level=1).
+        """
+        e0, n0 = wgs84_to_utm(30.3500, 30.3800, utm_zone=36)
+        transform = GeoTransform(
+            origin_x=e0,
+            pixel_width=10.0,
+            row_rotation=0.0,
+            origin_y=n0 + 1280.0,
+            col_rotation=0.0,
+            pixel_height=-10.0,
+        )
+        # 128x128 raster with deterministic gradient so every pixel has a distinct verifiable value
+        grid = [[float(1000 + (r * 7 + c * 3) % 4000) for c in range(128)] for r in range(128)]
+        cog_path = os.path.join(self.temp_dir, "large_sentinel2_tiled_cog.tif")
+        GeoTiffCogProcessor.write_tiled_cog(
+            file_path=cog_path,
+            band_data=RasterBandData("B08", 128, 128, 32636, transform, grid, nodata_value=0.0, spatial_resolution_m=10.0),
+            tile_width=16,
+            tile_height=16,
+            dtype="uint16",
+            compress=False,  # Keep uncompressed so file size is >35 KB across 64 tiles
+            include_overview=True,
+        )
+        with open(cog_path, "rb") as f:
+            cog_bytes = f.read()
+        total_cog_size = len(cog_bytes)
+        self.assertGreater(total_cog_size, 32768)
+
+        # Case 1: Valid local tiled COG full read & overview read
+        local_full = GeoTiffCogProcessor.read_geotiff(cog_path, band_name="B08")
+        self.assertEqual((local_full.width, local_full.height), (128, 128))
+        self.assertEqual(local_full.crs_epsg, 32636)
+        self.assertAlmostEqual(local_full.values[5][9], grid[5][9], places=2)
+
+        local_ovr = GeoTiffCogProcessor.read_geotiff(cog_path, band_name="B08", overview_level=1)
+        self.assertEqual((local_ovr.width, local_ovr.height), (64, 64))
+        self.assertAlmostEqual(local_ovr.transform.pixel_width, 20.0, places=3)
+
+        # Case 2, 3, 7: Remote COG server supporting HTTP Range requests (206 Partial Content)
+        class RangeCogHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path != "/sentinel2/B08.tif":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                range_hdr = self.headers.get("Range")
+                if range_hdr and range_hdr.startswith("bytes="):
+                    span = range_hdr[len("bytes=") :].split("-")
+                    start = int(span[0])
+                    end = min(total_cog_size - 1, int(span[1]))
+                    chunk = cog_bytes[start : end + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Type", "image/tiff")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{total_cog_size}")
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    self.wfile.write(chunk)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/tiff")
+                    self.send_header("Content-Length", str(total_cog_size))
+                    self.end_headers()
+                    self.wfile.write(cog_bytes)
+
+        cog_server = ThreadingHTTPServer(("127.0.0.1", 0), RangeCogHandler)
+        cog_port = cog_server.server_address[1]
+        threading.Thread(target=cog_server.serve_forever, daemon=True).start()
+
+        try:
+            cog_url = f"http://127.0.0.1:{cog_port}/sentinel2/B08.tif"
+            # Small farm polygon in the top-left tile (rows 2..8, cols 2..8)
+            lon_tl, lat_tl = utm_to_wgs84(e0 + 25.0, n0 + 1280.0 - 25.0, utm_zone=36)
+            lon_br, lat_br = utm_to_wgs84(e0 + 75.0, n0 + 1280.0 - 75.0, utm_zone=36)
+            small_farm_poly = {
+                "type": "Polygon",
+                "coordinates": [[
+                    [lon_tl, lat_br],
+                    [lon_br, lat_br],
+                    [lon_br, lat_tl],
+                    [lon_tl, lat_tl],
+                    [lon_tl, lat_br],
+                ]],
+            }
+
+            with RemoteCogHttpClient(require_range_support=True) as client:
+                window_band = GeoTiffCogProcessor.read_geotiff(
+                    cog_url,
+                    band_name="B08",
+                    farm_polygon_geojson=small_farm_poly,
+                    http_client=client,
+                )
+                self.assertTrue(client.server_supports_range)
+                self.assertEqual(client.full_downloads_made, 0)
+                # Only 1 header range request + 1 intersecting tile request (out of 64 tiles!)
+                self.assertGreaterEqual(client.range_requests_made, 2)
+                self.assertLessEqual(client.range_requests_made, 4)
+                # Window dimensions are much smaller than the full 128x128 scene
+                self.assertLess(window_band.width, 20)
+                self.assertLess(window_band.height, 20)
+                self.assertEqual(window_band.crs_epsg, 32636)
+
+                # Also verify reading remote overview IFD (overview_level=1) over HTTP Range
+                remote_ovr = GeoTiffCogProcessor.read_geotiff(
+                    cog_url,
+                    band_name="B08",
+                    overview_level=1,
+                    farm_polygon_geojson=small_farm_poly,
+                    http_client=client,
+                )
+                self.assertAlmostEqual(remote_ovr.transform.pixel_width, 20.0, places=3)
+            self.assertTrue(client.closed)
+        finally:
+            cog_server.shutdown()
+            cog_server.server_close()
+
+    def test_remote_cog_non_range_server_and_interrupted_download(self):
+        """
+        PRIORITY 2 Remote COG Error Handling Suite (Cases 4 & 6):
+        - Case 4: Server ignoring Range header (returns HTTP 200 OK instead of 206 Partial Content)
+          is rejected with RangeRequestNotSupportedError when require_range_support=True or oversized,
+          and safely validated when fallback is permitted.
+        - Case 6: Server whose transfer is interrupted before delivering Content-Length bytes
+          is rejected with RasterDownloadInterruptedError.
+        """
+        t_deg = GeoTransform(30.3500, 0.0001, 0.0, 30.3810, 0.0, -0.0001)
+        grid = [[2500.0 for _ in range(8)] for _ in range(8)]
+        tif_path = os.path.join(self.temp_dir, "small_test.tif")
+        GeoTiffCogProcessor.write_tiled_cog(
+            tif_path,
+            RasterBandData("B04", 8, 8, 4326, t_deg, grid, nodata_value=0.0),
+            tile_width=4,
+            tile_height=4,
+        )
+        with open(tif_path, "rb") as f:
+            tif_bytes = f.read()
+
+        class NonRangeAndInterruptedHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/no_range.tif":
+                    # Ignores Range header and always responds with 200 OK
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/tiff")
+                    self.send_header("Content-Length", str(len(tif_bytes)))
+                    self.end_headers()
+                    self.wfile.write(tif_bytes)
+                elif self.path == "/interrupted.tif":
+                    # Promises full file in Content-Range / Content-Length but truncates after 40 bytes
+                    self.send_response(206)
+                    self.send_header("Content-Type", "image/tiff")
+                    self.send_header("Content-Range", f"bytes 0-16383/{len(tif_bytes) + 50000}")
+                    self.send_header("Content-Length", "16384")
+                    self.end_headers()
+                    self.wfile.write(tif_bytes[:40])
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), NonRangeAndInterruptedHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        try:
+            no_range_url = f"http://127.0.0.1:{port}/no_range.tif"
+            interrupted_url = f"http://127.0.0.1:{port}/interrupted.tif"
+
+            # Case 4a: When require_range_support=True, 200 OK raises RangeRequestNotSupportedError
+            with self.assertRaises(RangeRequestNotSupportedError):
+                GeoTiffCogProcessor.read_geotiff(no_range_url, require_range_support=True)
+
+            # Case 4b: When payload exceeds max_unranged_bytes, 200 OK raises RangeRequestNotSupportedError
+            with self.assertRaises(RangeRequestNotSupportedError):
+                GeoTiffCogProcessor.read_geotiff(no_range_url, max_unranged_bytes=100)
+
+            # Case 4c: When within max_unranged_bytes and fallback allowed, reads and verifies full Content-Length
+            with RemoteCogHttpClient(require_range_support=False) as fallback_client:
+                fallback_band = GeoTiffCogProcessor.read_geotiff(no_range_url, http_client=fallback_client)
+                self.assertFalse(fallback_client.server_supports_range)
+                self.assertEqual(fallback_client.full_downloads_made, 1)
+                self.assertEqual((fallback_band.width, fallback_band.height), (8, 8))
+
+            # Case 6: Interrupted download raises RasterDownloadInterruptedError
+            with self.assertRaises(RasterDownloadInterruptedError):
+                with RemoteCogHttpClient(max_retries=0) as int_client:
+                    GeoTiffCogProcessor.read_geotiff(interrupted_url, http_client=int_client)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_corrupted_tiff_missing_bands_unsupported_crs_and_invalid_url(self):
+        """
+        PRIORITY 2 Raster Integrity Validation Suite (Cases 5, 8, 9, 10):
+        - Case 5: Corrupted TIFF (too short, invalid magic, or corrupted DEFLATE tile) -> RasterIntegrityError.
+        - Case 8: Raster pipeline with missing required Sentinel-2 bands -> MissingBandError.
+        - Case 9: Unsupported Coordinate Reference System (e.g. EPSG:99999 or EPSG:3857) -> UnsupportedCrsError.
+        - Case 10: Invalid asset URL (bad scheme, missing host, or HTTP 404) -> InvalidAssetUrlError.
+        """
+        # Case 5a: Corrupted TIFF header (smaller than 8 bytes)
+        with self.assertRaises(RasterIntegrityError):
+            GeoTiffCogProcessor.parse_geotiff_bytes(b"II\x2a")
+
+        # Case 5b: Corrupted TIFF magic number (43 instead of 42)
+        bad_magic = struct.pack("<2sHI", b"II", 43, 8) + b"\x00" * 32
+        with self.assertRaises(RasterIntegrityError):
+            GeoTiffCogProcessor.parse_geotiff_bytes(bad_magic)
+
+        # Case 5c: Corrupted DEFLATE compressed tile payload
+        t_deg = GeoTransform(30.3500, 0.0001, 0.0, 30.3810, 0.0, -0.0001)
+        valid_path = os.path.join(self.temp_dir, "valid_deflate.tif")
+        GeoTiffCogProcessor.write_tiled_cog(
+            valid_path,
+            RasterBandData("B08", 8, 8, 4326, t_deg, [[1500.0] * 8 for _ in range(8)]),
+            tile_width=8,
+            tile_height=8,
+            compress=True,
+            include_overview=False,
+        )
+        with open(valid_path, "rb") as f:
+            raw_tif = bytearray(f.read())
+        # Corrupt the compressed zlib bytes at the end of the file
+        for i in range(len(raw_tif) - 8, len(raw_tif)):
+            raw_tif[i] ^= 0xFF
+        with self.assertRaises(RasterIntegrityError):
+            GeoTiffCogProcessor.parse_geotiff_bytes(bytes(raw_tif))
+
+        # Case 8: Missing required Sentinel-2 bands raises MissingBandError
+        farm_poly = {
+            "type": "Polygon",
+            "coordinates": [[
+                [30.3500, 30.3800],
+                [30.3510, 30.3800],
+                [30.3510, 30.3810],
+                [30.3500, 30.3810],
+                [30.3500, 30.3800],
+            ]],
+        }
+        with self.assertRaises(MissingBandError):
+            process_sentinel2_raster_bands(
+                band_sources={"B04": valid_path, "B08": valid_path},  # Missing B02, B05, B06, B8A, B11, SCL
+                farm_polygon_geojson=farm_poly,
+            )
+
+        # Case 9: Unsupported CRS raises UnsupportedCrsError
+        with self.assertRaises(UnsupportedCrsError):
+            validate_supported_crs(99999)
+        with self.assertRaises(UnsupportedCrsError):
+            validate_supported_crs(3857)
+        with self.assertRaises(UnsupportedCrsError):
+            GeoTiffCogProcessor.write_geotiff(
+                os.path.join(self.temp_dir, "bad_crs.tif"),
+                RasterBandData("B08", 4, 4, 99999, t_deg, [[1000.0] * 4 for _ in range(4)]),
+            )
+
+        # Craft a binary GeoTIFF with EPSG:99999 inside GeoKeyDirectoryTag and verify read_geotiff rejects it
+        with open(valid_path, "rb") as f:
+            epsg_mod_bytes = f.read().replace(struct.pack("<H", 4326), struct.pack("<H", 3857))
+        with self.assertRaises(UnsupportedCrsError):
+            GeoTiffCogProcessor.parse_geotiff_bytes(epsg_mod_bytes)
+
+        # Case 10: Invalid asset URL raises InvalidAssetUrlError
+        with self.assertRaises(InvalidAssetUrlError):
+            GeoTiffCogProcessor.read_geotiff("ftp://invalid-scheme.example.com/B08.tif")
+        with self.assertRaises(InvalidAssetUrlError):
+            GeoTiffCogProcessor.read_geotiff("http:///missing-host.tif")
+        with self.assertRaises(InvalidAssetUrlError):
+            GeoTiffCogProcessor.read_geotiff("https://earth-search.aws.element84.com/")
+        with self.assertRaises(InvalidAssetUrlError):
+            GeoTiffCogProcessor.read_geotiff("/nonexistent/local/path/to/band.tif")
+
 
 if __name__ == "__main__":
     unittest.main()
+

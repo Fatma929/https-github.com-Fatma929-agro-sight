@@ -28,12 +28,16 @@ Production geospatial engine supporting:
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
 import struct
 import tempfile
+import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from dataclasses import dataclass, asdict, field
@@ -49,9 +53,11 @@ except ImportError:
 try:
     import rasterio  # type: ignore
     from rasterio.transform import Affine  # type: ignore
+    from rasterio.windows import from_bounds as rasterio_window_from_bounds  # type: ignore
     HAS_RASTERIO = True
 except ImportError:
     rasterio = None  # type: ignore
+    rasterio_window_from_bounds = None  # type: ignore
     HAS_RASTERIO = False
 
 try:
@@ -62,6 +68,49 @@ except ImportError:
     HAS_SHAPELY = False
 
 
+class RasterAccessError(ValueError):
+    """Base exception for local and remote COG/GeoTIFF raster access and validation failures."""
+    def __init__(self, message: str, error_code: str = "RASTER_ACCESS_ERROR"):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+class RasterIntegrityError(RasterAccessError):
+    """Raised when a GeoTIFF/COG has a corrupted header, malformed IFD, or invalid deflate stream."""
+    def __init__(self, message: str):
+        super().__init__(message, error_code="CORRUPTED_RASTER_TIFF")
+
+
+class RasterDownloadInterruptedError(RasterAccessError):
+    """Raised when an HTTP/COG stream terminates before delivering the expected byte range or Content-Length."""
+    def __init__(self, message: str):
+        super().__init__(message, error_code="DOWNLOAD_INTERRUPTED")
+
+
+class RangeRequestNotSupportedError(RasterAccessError):
+    """Raised when a remote COG server does not support HTTP Range requests (returns 200 instead of 206)."""
+    def __init__(self, message: str):
+        super().__init__(message, error_code="HTTP_RANGE_NOT_SUPPORTED")
+
+
+class UnsupportedCrsError(RasterAccessError):
+    """Raised when a raster has an unsupported, missing, or invalid Coordinate Reference System (EPSG)."""
+    def __init__(self, message: str):
+        super().__init__(message, error_code="UNSUPPORTED_RASTER_CRS")
+
+
+class MissingBandError(RasterAccessError):
+    """Raised when required Sentinel-2 spectral or SCL bands are missing."""
+    def __init__(self, message: str):
+        super().__init__(message, error_code="INCOMPLETE_BAND_ASSETS")
+
+
+class InvalidAssetUrlError(RasterAccessError):
+    """Raised when a remote raster asset URL is malformed, uses an unsupported scheme, or returns HTTP 404/4xx."""
+    def __init__(self, message: str):
+        super().__init__(message, error_code="INVALID_ASSET_URL")
+
+
 # ESA Sentinel-2 L2A Scene Classification Layer (SCL) classes to mask:
 # 0: No Data, 1: Saturated/Defective, 2: Dark Area/Cast Shadows, 3: Cloud Shadows,
 # 8: Cloud Medium Probability, 9: Cloud High Probability, 10: Thin Cirrus, 11: Snow/Ice
@@ -69,6 +118,7 @@ MASKED_SCL_CLASSES: Set[int] = {0, 1, 3, 8, 9, 10, 11}
 SHADOW_OR_CLOUD_SCL_CLASSES: Set[int] = {3, 8, 9, 10}
 NODATA_OR_DEFECTIVE_SCL_CLASSES: Set[int] = {0, 1, 11}
 EPSILON: float = 1e-6
+
 
 
 @dataclass(frozen=True)
@@ -308,24 +358,361 @@ def utm_to_wgs84(easting: float, northing: float, utm_zone: int = 36) -> Tuple[f
     return math.degrees(lon_rad), math.degrees(lat_rad)
 
 
+def validate_supported_crs(crs_epsg: Any) -> int:
+    """
+    Validate that the raster Coordinate Reference System (EPSG code) is supported.
+    Supported CRS codes:
+    - EPSG:4326 (WGS 84 geographic)
+    - EPSG:32601 .. EPSG:32660 (WGS 84 / UTM Northern Hemisphere zones 1N-60N)
+    - EPSG:32701 .. EPSG:32760 (WGS 84 / UTM Southern Hemisphere zones 1S-60S)
+    """
+    try:
+        code = int(crs_epsg)
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedCrsError(f"Invalid non-integer CRS EPSG code: {crs_epsg!r}") from exc
+
+    if code == 4326 or (32601 <= code <= 32660) or (32701 <= code <= 32760):
+        return code
+    raise UnsupportedCrsError(
+        f"Unsupported Coordinate Reference System EPSG:{code}. "
+        "Supported CRS codes are EPSG:4326, EPSG:32601-32660 (UTM North), and EPSG:32701-32760 (UTM South)."
+    )
+
+
 def coordinate_to_wgs84(x: float, y: float, crs_epsg: int) -> Tuple[float, float]:
-    """Transform (x, y) from raster CRS (`EPSG:4326` or `EPSG:326xx`) to WGS84 `(lon, lat)`."""
+    """Transform (x, y) from raster CRS (`EPSG:4326`, `EPSG:326xx`, or `EPSG:327xx`) to WGS84 `(lon, lat)`."""
+    validate_supported_crs(crs_epsg)
     if crs_epsg == 4326:
         return x, y
     if 32601 <= crs_epsg <= 32660:
         zone = crs_epsg - 32600
         return utm_to_wgs84(x, y, utm_zone=zone)
-    return x, y
+    if 32701 <= crs_epsg <= 32760:
+        zone = crs_epsg - 32700
+        return utm_to_wgs84(x, y - 10000000.0, utm_zone=zone)
+    raise UnsupportedCrsError(f"Unsupported CRS EPSG:{crs_epsg}")
 
 
 def wgs84_to_raster_crs(lon: float, lat: float, crs_epsg: int) -> Tuple[float, float]:
     """Transform WGS84 `(lon, lat)` to raster CRS `(x, y)`."""
+    validate_supported_crs(crs_epsg)
     if crs_epsg == 4326:
         return lon, lat
     if 32601 <= crs_epsg <= 32660:
         zone = crs_epsg - 32600
         return wgs84_to_utm(lon, lat, utm_zone=zone)
-    return lon, lat
+    if 32701 <= crs_epsg <= 32760:
+        zone = crs_epsg - 32700
+        easting, northing = wgs84_to_utm(lon, lat, utm_zone=zone)
+        return easting, northing + 10000000.0
+    raise UnsupportedCrsError(f"Unsupported CRS EPSG:{crs_epsg}")
+
+
+def extract_geojson_wgs84_bounds(polygon_geojson: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    """Extract `(min_lon, min_lat, max_lon, max_lat)` bounding box from a GeoJSON Polygon/Feature."""
+    gtype = polygon_geojson.get("type")
+    if gtype == "Feature":
+        return extract_geojson_wgs84_bounds(polygon_geojson.get("geometry") or {})
+    if gtype == "FeatureCollection":
+        features = polygon_geojson.get("features") or []
+        if not features:
+            raise ValueError("Empty FeatureCollection has no bounding box")
+        boxes = [extract_geojson_wgs84_bounds(f) for f in features]
+        return (
+            min(b[0] for b in boxes),
+            min(b[1] for b in boxes),
+            max(b[2] for b in boxes),
+            max(b[3] for b in boxes),
+        )
+    coords = polygon_geojson.get("coordinates") or []
+    pts: List[Tuple[float, float]] = []
+    if gtype == "Polygon" and coords:
+        for pt in coords[0]:
+            pts.append((float(pt[0]), float(pt[1])))
+    elif gtype == "MultiPolygon" and coords:
+        for poly in coords:
+            if poly:
+                for pt in poly[0]:
+                    pts.append((float(pt[0]), float(pt[1])))
+    if not pts:
+        raise ValueError(f"Could not extract coordinates from GeoJSON of type {gtype!r}")
+    lons = [p[0] for p in pts]
+    lats = [p[1] for p in pts]
+    return min(lons), min(lats), max(lons), max(lats)
+
+
+# ==============================================================================
+# Remote Cloud-Optimized GeoTIFF (COG) HTTP Range Client with Connection Pooling
+# ==============================================================================
+
+class RemoteCogHttpClient:
+    """
+    Production HTTP/HTTPS client for remote Cloud-Optimized GeoTIFF (COG) access:
+    - Validates asset URLs (scheme, hostname, port, path).
+    - Pools HTTP/HTTPS connections by `(scheme, host, port)` for low-latency multi-tile Range requests.
+    - Executes targeted `Range: bytes=start-end` requests and verifies `206 Partial Content` and `Content-Range`.
+    - Detects servers that do not support HTTP Range requests (`200 OK` instead of `206 Partial Content`).
+    - Detects interrupted or truncated transfers where delivered bytes are fewer than promised.
+    - Retries transient socket/timeout errors with exponential backoff and deterministic resource cleanup.
+    """
+
+    def __init__(
+        self,
+        timeout_sec: float = 10.0,
+        max_retries: int = 2,
+        backoff_base_sec: float = 0.05,
+        require_range_support: bool = False,
+        max_unranged_bytes: int = 8 * 1024 * 1024,
+    ):
+        self.timeout_sec = float(timeout_sec)
+        self.max_retries = max(0, int(max_retries))
+        self.backoff_base_sec = float(backoff_base_sec)
+        self.require_range_support = bool(require_range_support)
+        self.max_unranged_bytes = int(max_unranged_bytes)
+
+        self._lock = threading.Lock()
+        self._pool: Dict[Tuple[str, str, int], http.client.HTTPConnection] = {}
+        self._unranged_body_cache: Dict[str, bytes] = {}
+        self._remote_size_cache: Dict[str, int] = {}
+
+        # Telemetry counters for auditing and testing
+        self.range_requests_made: int = 0
+        self.full_downloads_made: int = 0
+        self.bytes_downloaded: int = 0
+        self.connections_opened: int = 0
+        self.fetched_ranges: List[Tuple[int, int]] = []
+        self.server_supports_range: Optional[bool] = None
+        self.closed: bool = False
+
+    @staticmethod
+    def validate_url(url: str) -> urllib.parse.ParseResult:
+        if not isinstance(url, str) or not url.strip():
+            raise InvalidAssetUrlError("Remote raster asset URL must be a non-empty string")
+        if any( ord(ch) < 32 or ch.isspace() for ch in url ):
+            raise InvalidAssetUrlError(f"Remote raster asset URL contains invalid whitespace/control characters: {url!r}")
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise InvalidAssetUrlError(f"Unsupported URL scheme {parsed.scheme!r} in {url!r} (expected http or https)")
+        if not parsed.hostname or "." not in parsed.hostname and parsed.hostname not in ("localhost",):
+            raise InvalidAssetUrlError(f"Invalid or missing hostname in asset URL: {url!r}")
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise InvalidAssetUrlError(f"Invalid port in asset URL {url!r}: {exc}") from exc
+        if not parsed.path or parsed.path == "/":
+            raise InvalidAssetUrlError(f"Asset URL is missing a valid raster file path: {url!r}")
+        return parsed
+
+    def _acquire_connection(self, parsed: urllib.parse.ParseResult) -> Tuple[Tuple[str, str, int], http.client.HTTPConnection]:
+        scheme = parsed.scheme
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if scheme == "https" else 80)
+        key = (scheme, host, port)
+        with self._lock:
+            conn = self._pool.pop(key, None)
+        if conn is None:
+            if scheme == "https":
+                conn = http.client.HTTPSConnection(host, port, timeout=self.timeout_sec)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=self.timeout_sec)
+            with self._lock:
+                self.connections_opened += 1
+        return key, conn
+
+    def _release_connection(self, key: Tuple[str, str, int], conn: http.client.HTTPConnection) -> None:
+        with self._lock:
+            if self.closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+            self._pool[key] = conn
+
+    def fetch_range(self, url: str, start_byte: int, end_byte: int) -> bytes:
+        """
+        Fetch inclusive byte range `[start_byte, end_byte]` from a remote COG URL.
+        """
+        if start_byte < 0 or end_byte < start_byte:
+            raise ValueError(f"Invalid byte range [{start_byte}, {end_byte}]")
+
+        parsed = self.validate_url(url)
+
+        # If a non-Range server fallback already cached the full validated file, slice from cache
+        with self._lock:
+            if url in self._unranged_body_cache:
+                cached = self._unranged_body_cache[url]
+                if start_byte >= len(cached):
+                    raise RasterIntegrityError(
+                        f"Requested byte offset {start_byte} exceeds remote file size {len(cached)}"
+                    )
+                return cached[start_byte : min(len(cached), end_byte + 1)]
+
+        path_with_query = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        last_error: Optional[Exception] = None
+
+        for attempt in range(self.max_retries + 1):
+            key, conn = self._acquire_connection(parsed)
+            try:
+                headers = {
+                    "User-Agent": "AgroSight-Sentinel2-COGEngine/3.0",
+                    "Range": f"bytes={start_byte}-{end_byte}",
+                    "Connection": "keep-alive",
+                }
+                conn.request("GET", path_with_query, headers=headers)
+                resp = conn.getresponse()
+                status = resp.status
+                content_length_hdr = resp.getheader("Content-Length")
+                content_range_hdr = resp.getheader("Content-Range")
+                raw_body = resp.read()
+
+                if status in (400, 401, 403, 404, 410):
+                    conn.close()
+                    raise InvalidAssetUrlError(
+                        f"Remote raster asset URL {url!r} returned HTTP {status}"
+                    )
+                if status == 416:
+                    conn.close()
+                    raise RasterIntegrityError(
+                        f"Requested range bytes={start_byte}-{end_byte} is out of bounds (HTTP 416) for {url!r}"
+                    )
+                if status >= 500:
+                    conn.close()
+                    raise RasterDownloadInterruptedError(
+                        f"Remote raster server returned HTTP {status} for {url!r}"
+                    )
+
+                # Verify that the response body was not truncated mid-stream
+                if content_length_hdr is not None:
+                    expected_len = int(content_length_hdr)
+                    if len(raw_body) < expected_len:
+                        conn.close()
+                        raise RasterDownloadInterruptedError(
+                            f"Interrupted download from {url!r}: received {len(raw_body)} of {expected_len} bytes"
+                        )
+
+                if status == 206:
+                    # Server supports HTTP Range requests
+                    expected_span = end_byte - start_byte + 1
+                    if content_range_hdr:
+                        # Format: bytes start-end/total
+                        try:
+                            range_part = content_range_hdr.strip().split(" ")[-1]
+                            span_str, total_str = range_part.split("/")
+                            r_start_s, r_end_s = span_str.split("-")
+                            r_start, r_end = int(r_start_s), int(r_end_s)
+                            expected_span = r_end - r_start + 1
+                            if total_str != "*":
+                                total_size = int(total_str)
+                                with self._lock:
+                                    self._remote_size_cache[url] = total_size
+                        except Exception as exc:
+                            conn.close()
+                            raise RasterIntegrityError(
+                                f"Malformed Content-Range header {content_range_hdr!r} from {url!r}"
+                            ) from exc
+
+                    if len(raw_body) < expected_span:
+                        # Unless clamped by total known file size, fewer bytes means interrupted stream
+                        known_total = self._remote_size_cache.get(url)
+                        if known_total is None or (start_byte + len(raw_body) < min(known_total, end_byte + 1)):
+                            conn.close()
+                            raise RasterDownloadInterruptedError(
+                                f"Interrupted partial download from {url!r}: received {len(raw_body)} bytes, "
+                                f"expected {expected_span} bytes for range {start_byte}-{end_byte}"
+                            )
+
+                    with self._lock:
+                        self.server_supports_range = True
+                        self.range_requests_made += 1
+                        self.bytes_downloaded += len(raw_body)
+                        self.fetched_ranges.append((start_byte, end_byte))
+                    self._release_connection(key, conn)
+                    return raw_body
+
+                if status == 200:
+                    # Server ignored Range header and sent full response
+                    with self._lock:
+                        self.server_supports_range = False
+                    if self.require_range_support:
+                        conn.close()
+                        raise RangeRequestNotSupportedError(
+                            f"Remote server for {url!r} returned HTTP 200 OK instead of 206 Partial Content; "
+                            "HTTP Range requests are required for Cloud-Optimized GeoTIFF streaming."
+                        )
+                    if len(raw_body) > self.max_unranged_bytes:
+                        conn.close()
+                        raise RangeRequestNotSupportedError(
+                            f"Remote server for {url!r} does not support HTTP Range requests and full payload "
+                            f"({len(raw_body)} bytes) exceeds max_unranged_bytes ({self.max_unranged_bytes})"
+                        )
+                    if len(raw_body) == 0:
+                        conn.close()
+                        raise RasterDownloadInterruptedError(f"Empty HTTP 200 response from {url!r}")
+
+                    with self._lock:
+                        self.full_downloads_made += 1
+                        self.bytes_downloaded += len(raw_body)
+                        self._unranged_body_cache[url] = raw_body
+                        self._remote_size_cache[url] = len(raw_body)
+                    self._release_connection(key, conn)
+                    if start_byte >= len(raw_body):
+                        raise RasterIntegrityError(
+                            f"Requested byte offset {start_byte} exceeds full file size {len(raw_body)}"
+                        )
+                    return raw_body[start_byte : min(len(raw_body), end_byte + 1)]
+
+                conn.close()
+                raise RasterAccessError(f"Unexpected HTTP status {status} from {url!r}")
+
+            except (
+                InvalidAssetUrlError,
+                RangeRequestNotSupportedError,
+                RasterIntegrityError,
+            ):
+                raise
+            except (RasterDownloadInterruptedError, http.client.IncompleteRead, TimeoutError) as exc:
+                if not isinstance(exc, RasterDownloadInterruptedError):
+                    exc = RasterDownloadInterruptedError(f"Interrupted download from {url!r}: {exc}")
+                last_error = exc
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if attempt < self.max_retries:
+                    time.sleep(self.backoff_base_sec * (2 ** attempt))
+                else:
+                    raise exc
+            except Exception as exc:
+                last_error = exc
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if attempt < self.max_retries:
+                    time.sleep(self.backoff_base_sec * (2 ** attempt))
+                else:
+                    raise InvalidAssetUrlError(f"Failed to connect to remote raster URL {url!r}: {exc}") from exc
+
+        raise RasterDownloadInterruptedError(f"Exhausted retries fetching range from {url!r}: {last_error}")
+
+    def close(self) -> None:
+        """Deterministically close all pooled HTTP/HTTPS connections."""
+        with self._lock:
+            self.closed = True
+            conns = list(self._pool.values())
+            self._pool.clear()
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "RemoteCogHttpClient":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
 
 # ==============================================================================
@@ -335,10 +722,16 @@ def wgs84_to_raster_crs(lon: float, lat: float, crs_epsg: int) -> Tuple[float, f
 class GeoTiffCogProcessor:
     """
     Reads and writes georeferenced GeoTIFF / Cloud-Optimized GeoTIFF (COG) files.
-    Uses `rasterio` when installed, and seamlessly uses an RFC-compliant binary TIFF/GeoTIFF
-    reader/writer when running in environments without C GDAL bindings.
+    Supports:
+    - Local GeoTIFF and tiled COG files.
+    - Remote Cloud-Optimized GeoTIFFs accessed via HTTP Range requests (`RemoteCogHttpClient`)
+      fetching ONLY the TIFF header/IFD directory and the internal tiles intersecting the target
+      farm polygon or spatial window.
+    - Overview IFDs (reduced-resolution pyramids) in multi-IFD COGs.
+    - Strict validation of TIFF integrity, dimensions, CRS, GeoTransform, NoData, and band types.
     """
 
+    TAG_NEW_SUBFILE_TYPE = 254
     TAG_IMAGE_WIDTH = 256
     TAG_IMAGE_LENGTH = 257
     TAG_BITS_PER_SAMPLE = 258
@@ -358,6 +751,18 @@ class GeoTiffCogProcessor:
     TAG_GEO_KEY_DIRECTORY = 34735
     TAG_GDAL_NODATA = 42113
 
+    INITIAL_HEADER_RANGE_BYTES = 16384
+
+    TYPE_SIZES: Dict[int, Tuple[int, str]] = {
+        1: (1, "B"),   # BYTE
+        2: (1, "s"),   # ASCII
+        3: (2, "H"),   # SHORT
+        4: (4, "I"),   # LONG
+        5: (8, "II"),  # RATIONAL
+        11: (4, "f"),  # FLOAT
+        12: (8, "d"),  # DOUBLE
+    }
+
     @classmethod
     def write_geotiff(
         cls,
@@ -370,9 +775,12 @@ class GeoTiffCogProcessor:
         Write a georeferenced single-band GeoTIFF file preserving CRS (EPSG),
         ModelPixelScaleTag, ModelTiepointTag, and GDAL_NODATA.
         """
+        validate_supported_crs(band_data.crs_epsg)
         os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
         height = band_data.height
         width = band_data.width
+        if width <= 0 or height <= 0:
+            raise RasterIntegrityError(f"Cannot write GeoTIFF with non-positive dimensions {width}x{height}")
 
         if HAS_RASTERIO and HAS_NUMPY:
             arr = np.array(band_data.values, dtype=np.float32 if dtype == "float32" else np.uint16)
@@ -399,10 +807,9 @@ class GeoTiffCogProcessor:
                 dst.write(arr, 1)
             return file_path
 
-        # Binary GeoTIFF writer (Little-Endian 'II', magic 42)
         is_float = dtype == "float32"
         bits_per_sample = 32 if is_float else 16
-        sample_format = 3 if is_float else 1  # 3 = IEEE floating point, 1 = unsigned integer
+        sample_format = 3 if is_float else 1
 
         raw_pixels = bytearray()
         for r in range(height):
@@ -416,12 +823,11 @@ class GeoTiffCogProcessor:
 
         if compress:
             pixel_payload = zlib.compress(bytes(raw_pixels))
-            compression_code = 8  # Deflate
+            compression_code = 8
         else:
             pixel_payload = bytes(raw_pixels)
-            compression_code = 1  # Uncompressed
+            compression_code = 1
 
-        # GeoTIFF tags payload
         pixel_scale = struct.pack(
             "<3d",
             float(abs(band_data.transform.pixel_width)),
@@ -437,22 +843,17 @@ class GeoTiffCogProcessor:
             float(band_data.transform.origin_y),
             0.0,
         )
-        gt_model_type = 2 if band_data.crs_epsg == 4326 else 1  # 2=Geographic, 1=Projected
+        gt_model_type = 2 if band_data.crs_epsg == 4326 else 1
         crs_key_id = 2048 if band_data.crs_epsg == 4326 else 3072
         geo_keys = struct.pack(
             "<16H",
             1, 1, 0, 3,
             1024, 0, 1, gt_model_type,
-            1025, 0, 1, 1,  # RasterPixelIsArea
+            1025, 0, 1, 1,
             crs_key_id, 0, 1, int(band_data.crs_epsg),
         )
         nodata_str = (str(band_data.nodata_value if band_data.nodata_value is not None else "nan") + "\x00").encode("ascii")
 
-        # Layout:
-        # 0..8: TIFF Header
-        # 8..8+len(pixel_payload): Image Strip
-        # Extra tag values block
-        # IFD table
         header_size = 8
         strip_offset = header_size
         strip_byte_count = len(pixel_payload)
@@ -471,14 +872,12 @@ class GeoTiffCogProcessor:
             nodata_str += b"\x00"
             ifd_offset += 1
 
-        # IFD entries must be sorted by Tag ID ascending
-        # Types: 2=ASCII, 3=SHORT (2 bytes), 4=LONG (4 bytes), 12=DOUBLE (8 bytes)
         entries = [
             (cls.TAG_IMAGE_WIDTH, 4, 1, width),
             (cls.TAG_IMAGE_LENGTH, 4, 1, height),
             (cls.TAG_BITS_PER_SAMPLE, 3, 1, bits_per_sample),
             (cls.TAG_COMPRESSION, 3, 1, compression_code),
-            (cls.TAG_PHOTOMETRIC, 3, 1, 1),  # BlackIsZero
+            (cls.TAG_PHOTOMETRIC, 3, 1, 1),
             (cls.TAG_STRIP_OFFSETS, 4, 1, strip_offset),
             (cls.TAG_SAMPLES_PER_PIXEL, 3, 1, 1),
             (cls.TAG_ROWS_PER_STRIP, 4, 1, height),
@@ -494,7 +893,7 @@ class GeoTiffCogProcessor:
         ifd_bytes = bytearray(struct.pack("<H", len(entries)))
         for tag, ttype, count, val_or_off in entries:
             ifd_bytes.extend(struct.pack("<HHII", tag, ttype, count, val_or_off))
-        ifd_bytes.extend(struct.pack("<I", 0))  # Next IFD offset = 0
+        ifd_bytes.extend(struct.pack("<I", 0))
 
         header = struct.pack("<2sHI", b"II", 42, ifd_offset)
 
@@ -510,152 +909,367 @@ class GeoTiffCogProcessor:
         return file_path
 
     @classmethod
-    def read_geotiff(
+    def write_tiled_cog(
         cls,
-        source_path_or_url: str,
-        band_name: str = "BAND",
-        max_bytes: int = 16 * 1024 * 1024,
-    ) -> RasterBandData:
+        file_path: str,
+        band_data: RasterBandData,
+        tile_width: int = 16,
+        tile_height: int = 16,
+        dtype: str = "uint16",
+        compress: bool = True,
+        include_overview: bool = True,
+    ) -> str:
         """
-        Read a GeoTIFF or Cloud-Optimized GeoTIFF from a local file path or HTTP(S) URL.
-        Extracts CRS (EPSG), affine GeoTransform, NoData value, and 2D pixel array.
+        Write a true Cloud-Optimized GeoTIFF (COG) with a header-first layout:
+        - Bytes 0..8: Little-Endian TIFF Header pointing to IFD 0 at byte 8.
+        - IFD 0 (Full-resolution tiled image) + optional IFD 1 (2x downsampled overview pyramid)
+          and all tag array blocks placed at the start of the file before any pixel tiles.
+        - Internal compressed/uncompressed tiles placed after the IFD metadata block so remote
+          HTTP Range clients can fetch the first 16 KB to inspect all tile offsets and then fetch
+          ONLY the individual tiles intersecting a farm polygon.
         """
-        if HAS_RASTERIO and os.path.exists(source_path_or_url):
-            with rasterio.open(source_path_or_url) as src:
-                arr = src.read(1)
-                t = src.transform
-                epsg = src.crs.to_epsg() if src.crs else 4326
-                values = [[float(arr[r, c]) for c in range(src.width)] for r in range(src.height)]
-                return RasterBandData(
-                    band_name=band_name,
-                    width=src.width,
-                    height=src.height,
-                    crs_epsg=epsg or 4326,
-                    transform=GeoTransform(t.c, t.a, t.b, t.f, t.d, t.e),
-                    values=values,
-                    nodata_value=src.nodata,
-                    spatial_resolution_m=abs(t.a),
-                )
+        validate_supported_crs(band_data.crs_epsg)
+        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+        height = band_data.height
+        width = band_data.width
+        if width <= 0 or height <= 0:
+            raise RasterIntegrityError(f"Invalid raster dimensions {width}x{height}")
 
-        if source_path_or_url.startswith("http://") or source_path_or_url.startswith("https://"):
-            req = urllib.request.Request(
-                source_path_or_url,
-                headers={"User-Agent": "AgroSight-Sentinel2-RasterEngine/2.0", "Range": f"bytes=0-{max_bytes - 1}"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = resp.read()
-        else:
-            with open(source_path_or_url, "rb") as f:
-                data = f.read()
+        is_float = dtype == "float32"
+        bits_per_sample = 32 if is_float else 16
+        sample_format = 3 if is_float else 1
+        compression_code = 8 if compress else 1
 
-        return cls.parse_geotiff_bytes(data, band_name=band_name)
+        def _encode_tiles(grid: List[List[float]], w: int, h: int, tw: int, th: int) -> List[bytes]:
+            tiles_x = (w + tw - 1) // tw
+            tiles_y = (h + th - 1) // th
+            encoded_list: List[bytes] = []
+            for ty in range(tiles_y):
+                for tx in range(tiles_x):
+                    buf = bytearray()
+                    r0 = ty * th
+                    c0 = tx * tw
+                    for tr in range(th):
+                        gr = r0 + tr
+                        for tc in range(tw):
+                            gc = c0 + tc
+                            if gr < h and gc < w:
+                                val = grid[gr][gc]
+                            else:
+                                val = float(band_data.nodata_value if band_data.nodata_value is not None else 0.0)
+                            if is_float:
+                                buf.extend(struct.pack("<f", float(val)))
+                            else:
+                                ival = 0 if math.isnan(val) else max(0, min(65535, int(round(val))))
+                                buf.extend(struct.pack("<H", ival))
+                    raw_tile = bytes(buf)
+                    encoded_list.append(zlib.compress(raw_tile) if compress else raw_tile)
+            return encoded_list
+
+        full_tiles = _encode_tiles(band_data.values, width, height, tile_width, tile_height)
+        num_full_tiles = len(full_tiles)
+
+        # Build 2x overview grid if requested and dimensions >= 4
+        has_ovr = include_overview and width >= 4 and height >= 4
+        ovr_w = max(1, (width + 1) // 2)
+        ovr_h = max(1, (height + 1) // 2)
+        ovr_tw = max(4, min(tile_width, ovr_w))
+        ovr_th = max(4, min(tile_height, ovr_h))
+        ovr_tiles: List[bytes] = []
+        if has_ovr:
+            ovr_grid: List[List[float]] = [[0.0 for _ in range(ovr_w)] for _ in range(ovr_h)]
+            for r in range(ovr_h):
+                for c in range(ovr_w):
+                    samples = []
+                    for dr in (0, 1):
+                        for dc in (0, 1):
+                            sr = min(height - 1, r * 2 + dr)
+                            sc = min(width - 1, c * 2 + dc)
+                            v = band_data.values[sr][sc]
+                            if not math.isnan(v):
+                                samples.append(v)
+                    ovr_grid[r][c] = sum(samples) / len(samples) if samples else 0.0
+            ovr_tiles = _encode_tiles(ovr_grid, ovr_w, ovr_h, ovr_tw, ovr_th)
+
+        pixel_scale = struct.pack(
+            "<3d",
+            float(abs(band_data.transform.pixel_width)),
+            float(abs(band_data.transform.pixel_height)),
+            0.0,
+        )
+        tiepoint = struct.pack(
+            "<6d",
+            0.0,
+            0.0,
+            0.0,
+            float(band_data.transform.origin_x),
+            float(band_data.transform.origin_y),
+            0.0,
+        )
+        gt_model_type = 2 if band_data.crs_epsg == 4326 else 1
+        crs_key_id = 2048 if band_data.crs_epsg == 4326 else 3072
+        geo_keys = struct.pack(
+            "<16H",
+            1, 1, 0, 3,
+            1024, 0, 1, gt_model_type,
+            1025, 0, 1, 1,
+            crs_key_id, 0, 1, int(band_data.crs_epsg),
+        )
+        nodata_str = (str(band_data.nodata_value if band_data.nodata_value is not None else 0) + "\x00").encode("ascii")
+        if len(nodata_str) % 2 == 1:
+            nodata_str += b"\x00"
+
+        # IFD 0 has 15 entries; IFD 1 (if present) has 11 entries
+        ifd0_entry_count = 15
+        ifd0_offset = 8
+        ifd0_size = 2 + ifd0_entry_count * 12 + 4
+
+        ifd1_entry_count = 11
+        ifd1_offset = (ifd0_offset + ifd0_size) if has_ovr else 0
+        ifd1_size = (2 + ifd1_entry_count * 12 + 4) if has_ovr else 0
+
+        extra_start = ifd0_offset + ifd0_size + ifd1_size
+        scale_offset = extra_start
+        tiepoint_offset = scale_offset + len(pixel_scale)
+        geokey_offset = tiepoint_offset + len(tiepoint)
+        nodata_offset = geokey_offset + len(geo_keys)
+
+        full_offsets_table_pos = nodata_offset + len(nodata_str)
+        full_counts_table_pos = full_offsets_table_pos + (num_full_tiles * 4 if num_full_tiles > 1 else 0)
+
+        num_ovr_tiles = len(ovr_tiles)
+        ovr_offsets_table_pos = full_counts_table_pos + (num_full_tiles * 4 if num_full_tiles > 1 else 0)
+        ovr_counts_table_pos = ovr_offsets_table_pos + (num_ovr_tiles * 4 if (has_ovr and num_ovr_tiles > 1) else 0)
+        data_start_offset = ovr_counts_table_pos + (num_ovr_tiles * 4 if (has_ovr and num_ovr_tiles > 1) else 0)
+
+        # Compute exact byte offsets for full-resolution tiles and overview tiles
+        curr_data_off = data_start_offset
+        full_tile_offsets: List[int] = []
+        full_tile_counts: List[int] = []
+        for t_bytes in full_tiles:
+            full_tile_offsets.append(curr_data_off)
+            full_tile_counts.append(len(t_bytes))
+            curr_data_off += len(t_bytes)
+
+        ovr_tile_offsets: List[int] = []
+        ovr_tile_counts: List[int] = []
+        for t_bytes in ovr_tiles:
+            ovr_tile_offsets.append(curr_data_off)
+            ovr_tile_counts.append(len(t_bytes))
+            curr_data_off += len(t_bytes)
+
+        ifd0_entries = [
+            (cls.TAG_NEW_SUBFILE_TYPE, 4, 1, 0),
+            (cls.TAG_IMAGE_WIDTH, 4, 1, width),
+            (cls.TAG_IMAGE_LENGTH, 4, 1, height),
+            (cls.TAG_BITS_PER_SAMPLE, 3, 1, bits_per_sample),
+            (cls.TAG_COMPRESSION, 3, 1, compression_code),
+            (cls.TAG_PHOTOMETRIC, 3, 1, 1),
+            (cls.TAG_SAMPLES_PER_PIXEL, 3, 1, 1),
+            (cls.TAG_TILE_WIDTH, 4, 1, tile_width),
+            (cls.TAG_TILE_LENGTH, 4, 1, tile_height),
+            (
+                cls.TAG_TILE_OFFSETS,
+                4,
+                num_full_tiles,
+                full_tile_offsets[0] if num_full_tiles == 1 else full_offsets_table_pos,
+            ),
+            (
+                cls.TAG_TILE_BYTE_COUNTS,
+                4,
+                num_full_tiles,
+                full_tile_counts[0] if num_full_tiles == 1 else full_counts_table_pos,
+            ),
+            (cls.TAG_SAMPLE_FORMAT, 3, 1, sample_format),
+            (cls.TAG_MODEL_PIXEL_SCALE, 12, 3, scale_offset),
+            (cls.TAG_MODEL_TIEPOINT, 12, 6, tiepoint_offset),
+            (cls.TAG_GEO_KEY_DIRECTORY, 3, 16, geokey_offset),
+        ]
+        ifd0_entries.sort(key=lambda e: e[0])
+
+        ifd0_bytes = bytearray(struct.pack("<H", len(ifd0_entries)))
+        for tag, ttype, count, val_or_off in ifd0_entries:
+            ifd0_bytes.extend(struct.pack("<HHII", tag, ttype, count, val_or_off))
+        ifd0_bytes.extend(struct.pack("<I", ifd1_offset))
+
+        ifd1_bytes = bytearray()
+        if has_ovr:
+            ifd1_entries = [
+                (cls.TAG_NEW_SUBFILE_TYPE, 4, 1, 1),  # Reduced-resolution overview
+                (cls.TAG_IMAGE_WIDTH, 4, 1, ovr_w),
+                (cls.TAG_IMAGE_LENGTH, 4, 1, ovr_h),
+                (cls.TAG_BITS_PER_SAMPLE, 3, 1, bits_per_sample),
+                (cls.TAG_COMPRESSION, 3, 1, compression_code),
+                (cls.TAG_PHOTOMETRIC, 3, 1, 1),
+                (cls.TAG_SAMPLES_PER_PIXEL, 3, 1, 1),
+                (cls.TAG_TILE_WIDTH, 4, 1, ovr_tw),
+                (cls.TAG_TILE_LENGTH, 4, 1, ovr_th),
+                (
+                    cls.TAG_TILE_OFFSETS,
+                    4,
+                    num_ovr_tiles,
+                    ovr_tile_offsets[0] if num_ovr_tiles == 1 else ovr_offsets_table_pos,
+                ),
+                (
+                    cls.TAG_TILE_BYTE_COUNTS,
+                    4,
+                    num_ovr_tiles,
+                    ovr_tile_counts[0] if num_ovr_tiles == 1 else ovr_counts_table_pos,
+                ),
+            ]
+            ifd1_entries.sort(key=lambda e: e[0])
+            ifd1_bytes.extend(struct.pack("<H", len(ifd1_entries)))
+            for tag, ttype, count, val_or_off in ifd1_entries:
+                ifd1_bytes.extend(struct.pack("<HHII", tag, ttype, count, val_or_off))
+            ifd1_bytes.extend(struct.pack("<I", 0))
+
+        header = struct.pack("<2sHI", b"II", 42, ifd0_offset)
+
+        with open(file_path, "wb") as f:
+            f.write(header)
+            f.write(ifd0_bytes)
+            if has_ovr:
+                f.write(ifd1_bytes)
+            f.write(pixel_scale)
+            f.write(tiepoint)
+            f.write(geo_keys)
+            f.write(nodata_str)
+            if num_full_tiles > 1:
+                f.write(struct.pack(f"<{num_full_tiles}I", *full_tile_offsets))
+                f.write(struct.pack(f"<{num_full_tiles}I", *full_tile_counts))
+            if has_ovr and num_ovr_tiles > 1:
+                f.write(struct.pack(f"<{num_ovr_tiles}I", *ovr_tile_offsets))
+                f.write(struct.pack(f"<{num_ovr_tiles}I", *ovr_tile_counts))
+            for t_bytes in full_tiles:
+                f.write(t_bytes)
+            for t_bytes in ovr_tiles:
+                f.write(t_bytes)
+
+        return file_path
 
     @classmethod
-    def parse_geotiff_bytes(cls, data: bytes, band_name: str = "BAND") -> RasterBandData:
-        """Parse binary TIFF / GeoTIFF bytes (supports little-endian and big-endian, strips & tiles)."""
-        if len(data) < 8:
-            raise ValueError("Invalid GeoTIFF: file is smaller than 8-byte TIFF header")
+    def _parse_ifd_chain_from_reader(
+        cls,
+        fetch_bytes_fn: Any,
+        strict_crs: bool = False,
+    ) -> Tuple[str, List[Dict[int, Any]]]:
+        """
+        Parse the TIFF header and traverse the IFD chain (IFD 0 + overview sub-IFDs)
+        using a byte-range reader callback `fetch_bytes_fn(start, end) -> bytes`.
+        """
+        header_chunk = fetch_bytes_fn(0, cls.INITIAL_HEADER_RANGE_BYTES - 1)
+        if len(header_chunk) < 8:
+            raise RasterIntegrityError(
+                f"Corrupted GeoTIFF: file is smaller than 8-byte TIFF header ({len(header_chunk)} bytes)"
+            )
 
-        endian_mark = data[:2]
+        endian_mark = header_chunk[:2]
         if endian_mark == b"II":
             endian = "<"
         elif endian_mark == b"MM":
             endian = ">"
         else:
-            raise ValueError(f"Invalid TIFF byte order marker: {endian_mark!r}")
+            raise RasterIntegrityError(f"Corrupted GeoTIFF: invalid byte order marker {endian_mark!r}")
 
-        magic, first_ifd_offset = struct.unpack(f"{endian}HI", data[2:8])
+        magic, first_ifd_offset = struct.unpack(f"{endian}HI", header_chunk[2:8])
         if magic != 42:
-            raise ValueError(f"Unsupported TIFF magic number: {magic} (expected 42)")
+            raise RasterIntegrityError(f"Corrupted GeoTIFF: unsupported magic number {magic} (expected 42)")
+        if first_ifd_offset < 8:
+            raise RasterIntegrityError(f"Corrupted GeoTIFF: invalid first IFD offset {first_ifd_offset}")
 
-        num_entries = struct.unpack(f"{endian}H", data[first_ifd_offset : first_ifd_offset + 2])[0]
-        tags: Dict[int, Any] = {}
+        def _get_slice(offset: int, length: int) -> bytes:
+            if offset < 0 or length <= 0:
+                raise RasterIntegrityError(f"Corrupted GeoTIFF: invalid slice offset={offset}, length={length}")
+            if offset + length <= len(header_chunk):
+                return header_chunk[offset : offset + length]
+            chunk = fetch_bytes_fn(offset, offset + length - 1)
+            if len(chunk) < length:
+                raise RasterIntegrityError(
+                    f"Corrupted or truncated GeoTIFF: expected {length} bytes at offset {offset}, got {len(chunk)}"
+                )
+            return chunk[:length]
 
-        type_sizes = {
-            1: (1, "B"),   # BYTE
-            2: (1, "s"),   # ASCII
-            3: (2, "H"),   # SHORT
-            4: (4, "I"),   # LONG
-            5: (8, "II"),  # RATIONAL
-            11: (4, "f"),  # FLOAT
-            12: (8, "d"),  # DOUBLE
-        }
+        ifds: List[Dict[int, Any]] = []
+        visited_offsets: Set[int] = set()
+        curr_ifd_off = first_ifd_offset
 
-        pos = first_ifd_offset + 2
-        for _ in range(num_entries):
-            tag, ttype, count, raw_val_offset = struct.unpack(f"{endian}HHII", data[pos : pos + 12])
-            pos += 12
-            if ttype not in type_sizes:
-                continue
-            unit_size, fmt_char = type_sizes[ttype]
-            total_bytes = unit_size * count
-            if total_bytes <= 4:
-                val_bytes = data[pos - 4 : pos - 4 + total_bytes]
-            else:
-                val_bytes = data[raw_val_offset : raw_val_offset + total_bytes]
+        while curr_ifd_off != 0 and len(ifds) < 8:
+            if curr_ifd_off in visited_offsets:
+                raise RasterIntegrityError("Corrupted GeoTIFF: circular IFD offset chain detected")
+            visited_offsets.add(curr_ifd_off)
 
-            if ttype == 2:
-                tags[tag] = val_bytes.decode("ascii", errors="ignore").rstrip("\x00")
-            else:
-                values = struct.unpack(f"{endian}{count}{fmt_char}", val_bytes)
-                tags[tag] = values[0] if count == 1 else list(values)
+            count_bytes = _get_slice(curr_ifd_off, 2)
+            num_entries = struct.unpack(f"{endian}H", count_bytes)[0]
+            if num_entries == 0 or num_entries > 512:
+                raise RasterIntegrityError(f"Corrupted GeoTIFF: invalid IFD entry count {num_entries}")
 
-        width = int(tags.get(cls.TAG_IMAGE_WIDTH, 0))
-        height = int(tags.get(cls.TAG_IMAGE_LENGTH, 0))
-        if width <= 0 or height <= 0:
-            raise ValueError("GeoTIFF missing valid ImageWidth or ImageLength tags")
+            entries_block = _get_slice(curr_ifd_off + 2, num_entries * 12 + 4)
+            tags: Dict[int, Any] = {}
+            pos = 0
+            for _ in range(num_entries):
+                tag, ttype, count, raw_val_offset = struct.unpack(f"{endian}HHII", entries_block[pos : pos + 12])
+                pos += 12
+                if ttype not in cls.TYPE_SIZES:
+                    continue
+                if count <= 0 or count > 10_000_000:
+                    raise RasterIntegrityError(f"Corrupted GeoTIFF: invalid count {count} for tag {tag}")
+                unit_size, fmt_char = cls.TYPE_SIZES[ttype]
+                total_bytes = unit_size * count
+                if total_bytes <= 4:
+                    val_bytes = entries_block[pos - 4 : pos - 4 + total_bytes]
+                else:
+                    val_bytes = _get_slice(raw_val_offset, total_bytes)
 
-        bits_per_sample = tags.get(cls.TAG_BITS_PER_SAMPLE, 16)
+                if ttype == 2:
+                    tags[tag] = val_bytes.decode("ascii", errors="ignore").rstrip("\x00")
+                else:
+                    values = struct.unpack(f"{endian}{count}{fmt_char}", val_bytes)
+                    tags[tag] = values[0] if count == 1 else list(values)
+
+            next_ifd_off = struct.unpack(f"{endian}I", entries_block[pos : pos + 4])[0]
+            ifds.append(tags)
+            curr_ifd_off = next_ifd_off
+
+        if not ifds:
+            raise RasterIntegrityError("Corrupted GeoTIFF: no valid IFD found")
+
+        # Validate primary IFD metadata
+        primary = ifds[0]
+        if strict_crs and cls.TAG_GEO_KEY_DIRECTORY not in primary:
+            raise UnsupportedCrsError("GeoTIFF is missing GeoKeyDirectoryTag (34735); CRS cannot be determined")
+
+        return endian, ifds
+
+    @classmethod
+    def _extract_georef_metadata(
+        cls,
+        primary_tags: Dict[int, Any],
+        target_tags: Dict[int, Any],
+        strict_crs: bool = False,
+    ) -> Tuple[int, int, int, GeoTransform, Optional[float], str, int, int]:
+        """
+        Validate and extract `(width, height, crs_epsg, transform, nodata_val, px_fmt, px_bytes, compression)`
+        from parsed IFD tags. Supports overview IFDs by scaling pixel resolution relative to primary IFD.
+        """
+        full_w = int(primary_tags.get(cls.TAG_IMAGE_WIDTH, 0))
+        full_h = int(primary_tags.get(cls.TAG_IMAGE_LENGTH, 0))
+        width = int(target_tags.get(cls.TAG_IMAGE_WIDTH, 0))
+        height = int(target_tags.get(cls.TAG_IMAGE_LENGTH, 0))
+        if width <= 0 or height <= 0 or full_w <= 0 or full_h <= 0:
+            raise RasterIntegrityError("GeoTIFF missing valid ImageWidth or ImageLength tags")
+
+        samples_per_pixel = int(target_tags.get(cls.TAG_SAMPLES_PER_PIXEL, primary_tags.get(cls.TAG_SAMPLES_PER_PIXEL, 1)))
+        if samples_per_pixel < 1:
+            raise RasterIntegrityError(f"Invalid SamplesPerPixel={samples_per_pixel}")
+
+        bits_per_sample = target_tags.get(cls.TAG_BITS_PER_SAMPLE, primary_tags.get(cls.TAG_BITS_PER_SAMPLE, 16))
         if isinstance(bits_per_sample, list):
             bits_per_sample = bits_per_sample[0]
-        compression = int(tags.get(cls.TAG_COMPRESSION, 1))
-        sample_format = tags.get(cls.TAG_SAMPLE_FORMAT, 1)
+        compression = int(target_tags.get(cls.TAG_COMPRESSION, primary_tags.get(cls.TAG_COMPRESSION, 1)))
+        sample_format = target_tags.get(cls.TAG_SAMPLE_FORMAT, primary_tags.get(cls.TAG_SAMPLE_FORMAT, 1))
         if isinstance(sample_format, list):
             sample_format = sample_format[0]
 
-        # Extract GeoTransform from ModelPixelScaleTag (33550) & ModelTiepointTag (33922)
-        pixel_scale = tags.get(cls.TAG_MODEL_PIXEL_SCALE, [10.0, 10.0, 0.0])
-        tiepoint = tags.get(cls.TAG_MODEL_TIEPOINT, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        scale_x = float(pixel_scale[0]) if isinstance(pixel_scale, list) and len(pixel_scale) >= 2 else 10.0
-        scale_y = float(pixel_scale[1]) if isinstance(pixel_scale, list) and len(pixel_scale) >= 2 else 10.0
-        if isinstance(tiepoint, list) and len(tiepoint) >= 6:
-            tp_i, tp_j, _, tp_x, tp_y, _ = [float(v) for v in tiepoint[:6]]
-            origin_x = tp_x - tp_i * scale_x
-            origin_y = tp_y + tp_j * scale_y
-        else:
-            origin_x, origin_y = 0.0, 0.0
-
-        transform = GeoTransform(
-            origin_x=origin_x,
-            pixel_width=scale_x,
-            row_rotation=0.0,
-            origin_y=origin_y,
-            col_rotation=0.0,
-            pixel_height=-scale_y,
-        )
-
-        # Extract EPSG code from GeoKeyDirectoryTag (34735)
-        crs_epsg = 4326
-        geo_keys = tags.get(cls.TAG_GEO_KEY_DIRECTORY)
-        if isinstance(geo_keys, list) and len(geo_keys) >= 4:
-            num_keys = int(geo_keys[3])
-            idx = 4
-            for _ in range(num_keys):
-                if idx + 4 <= len(geo_keys):
-                    k_id, k_loc, _, k_val = geo_keys[idx : idx + 4]
-                    if k_id in (2048, 3072) and k_loc == 0 and k_val > 0:
-                        crs_epsg = int(k_val)
-                    idx += 4
-
-        nodata_val: Optional[float] = 0.0
-        if cls.TAG_GDAL_NODATA in tags:
-            nd_str = str(tags[cls.TAG_GDAL_NODATA]).strip()
-            try:
-                nodata_val = float(nd_str)
-            except ValueError:
-                nodata_val = None
-
-        # Decode pixel buffer from strips or tiles
         if int(bits_per_sample) == 32 and int(sample_format) == 3:
             px_fmt = "f"
             px_bytes = 4
@@ -666,80 +1280,403 @@ class GeoTiffCogProcessor:
             px_fmt = "B"
             px_bytes = 1
         else:
-            raise ValueError(f"Unsupported BitsPerSample={bits_per_sample}, SampleFormat={sample_format}")
+            raise RasterIntegrityError(
+                f"Unsupported GeoTIFF BitsPerSample={bits_per_sample}, SampleFormat={sample_format}"
+            )
 
-        grid: List[List[float]] = [[float("nan") for _ in range(width)] for _ in range(height)]
+        pixel_scale = primary_tags.get(cls.TAG_MODEL_PIXEL_SCALE, [10.0, 10.0, 0.0])
+        tiepoint = primary_tags.get(cls.TAG_MODEL_TIEPOINT, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        scale_x = float(pixel_scale[0]) if isinstance(pixel_scale, list) and len(pixel_scale) >= 2 else 10.0
+        scale_y = float(pixel_scale[1]) if isinstance(pixel_scale, list) and len(pixel_scale) >= 2 else 10.0
+        if scale_x <= 0.0 or scale_y <= 0.0:
+            raise RasterIntegrityError(f"Invalid non-positive ModelPixelScaleTag: {pixel_scale!r}")
 
-        if cls.TAG_STRIP_OFFSETS in tags:
-            offsets = tags[cls.TAG_STRIP_OFFSETS]
-            byte_counts = tags[cls.TAG_STRIP_BYTE_COUNTS]
-            rows_per_strip = int(tags.get(cls.TAG_ROWS_PER_STRIP, height))
-            if not isinstance(offsets, list):
-                offsets = [offsets]
-            if not isinstance(byte_counts, list):
-                byte_counts = [byte_counts]
+        # Adjust pixel scale if reading a reduced-resolution overview IFD
+        ovr_factor_x = float(full_w) / float(width)
+        ovr_factor_y = float(full_h) / float(height)
+        eff_scale_x = scale_x * ovr_factor_x
+        eff_scale_y = scale_y * ovr_factor_y
 
-            current_row = 0
-            for off, bc in zip(offsets, byte_counts):
-                chunk = data[int(off) : int(off) + int(bc)]
-                if compression in (8, 32946):
-                    chunk = zlib.decompress(chunk)
-                elif compression != 1:
-                    raise ValueError(f"Unsupported TIFF compression method: {compression}")
-
-                rows_in_this_strip = min(rows_per_strip, height - current_row)
-                expected_vals = rows_in_this_strip * width
-                unpacked = struct.unpack(f"{endian}{expected_vals}{px_fmt}", chunk[: expected_vals * px_bytes])
-                for r_local in range(rows_in_this_strip):
-                    row_slice = unpacked[r_local * width : (r_local + 1) * width]
-                    grid[current_row + r_local] = [float(v) for v in row_slice]
-                current_row += rows_in_this_strip
-
-        elif cls.TAG_TILE_OFFSETS in tags:
-            tile_w = int(tags[cls.TAG_TILE_WIDTH])
-            tile_h = int(tags[cls.TAG_TILE_LENGTH])
-            offsets = tags[cls.TAG_TILE_OFFSETS]
-            byte_counts = tags[cls.TAG_TILE_BYTE_COUNTS]
-            if not isinstance(offsets, list):
-                offsets = [offsets]
-            if not isinstance(byte_counts, list):
-                byte_counts = [byte_counts]
-
-            tiles_across = (width + tile_w - 1) // tile_w
-            for tile_idx, (off, bc) in enumerate(zip(offsets, byte_counts)):
-                chunk = data[int(off) : int(off) + int(bc)]
-                if compression in (8, 32946):
-                    chunk = zlib.decompress(chunk)
-                elif compression != 1:
-                    raise ValueError(f"Unsupported TIFF tile compression: {compression}")
-
-                tile_vals = tile_w * tile_h
-                unpacked = struct.unpack(f"{endian}{tile_vals}{px_fmt}", chunk[: tile_vals * px_bytes])
-                tile_row_origin = (tile_idx // tiles_across) * tile_h
-                tile_col_origin = (tile_idx % tiles_across) * tile_w
-
-                for tr in range(tile_h):
-                    gr = tile_row_origin + tr
-                    if gr >= height:
-                        continue
-                    for tc in range(tile_w):
-                        gc = tile_col_origin + tc
-                        if gc >= width:
-                            continue
-                        grid[gr][gc] = float(unpacked[tr * tile_w + tc])
+        if isinstance(tiepoint, list) and len(tiepoint) >= 6:
+            tp_i, tp_j, _, tp_x, tp_y, _ = [float(v) for v in tiepoint[:6]]
+            origin_x = tp_x - tp_i * scale_x
+            origin_y = tp_y + tp_j * scale_y
         else:
-            raise ValueError("GeoTIFF contains neither StripOffsets nor TileOffsets")
+            origin_x, origin_y = 0.0, 0.0
 
-        return RasterBandData(
-            band_name=band_name,
+        transform = GeoTransform(
+            origin_x=origin_x,
+            pixel_width=eff_scale_x,
+            row_rotation=0.0,
+            origin_y=origin_y,
+            col_rotation=0.0,
+            pixel_height=-eff_scale_y,
+        )
+
+        crs_epsg: Optional[int] = None
+        geo_keys = primary_tags.get(cls.TAG_GEO_KEY_DIRECTORY)
+        if isinstance(geo_keys, list) and len(geo_keys) >= 4:
+            num_keys = int(geo_keys[3])
+            idx = 4
+            for _ in range(num_keys):
+                if idx + 4 <= len(geo_keys):
+                    k_id, k_loc, _, k_val = geo_keys[idx : idx + 4]
+                    if k_id in (2048, 3072) and k_loc == 0:
+                        crs_epsg = int(k_val)
+                    idx += 4
+        if crs_epsg is None:
+            if strict_crs:
+                raise UnsupportedCrsError("GeoTIFF GeoKeyDirectoryTag does not specify an EPSG code")
+            crs_epsg = 4326
+        validate_supported_crs(crs_epsg)
+
+        nodata_val: Optional[float] = 0.0
+        if cls.TAG_GDAL_NODATA in primary_tags:
+            nd_str = str(primary_tags[cls.TAG_GDAL_NODATA]).strip()
+            try:
+                nodata_val = float(nd_str)
+            except ValueError:
+                nodata_val = None
+
+        return width, height, crs_epsg, transform, nodata_val, px_fmt, px_bytes, compression
+
+    @classmethod
+    def _compute_pixel_window(
+        cls,
+        width: int,
+        height: int,
+        crs_epsg: int,
+        transform: GeoTransform,
+        farm_polygon_geojson: Optional[Dict[str, Any]] = None,
+        window_bounds_wgs84: Optional[Tuple[float, float, float, float]] = None,
+        padding_px: int = 2,
+    ) -> Tuple[int, int, int, int]:
+        """
+        Compute inclusive-exclusive pixel window `(row_min, row_max, col_min, col_max)`
+        covering the target farm polygon or WGS84 bounding box.
+        """
+        bounds = window_bounds_wgs84
+        if bounds is None and farm_polygon_geojson is not None:
+            bounds = extract_geojson_wgs84_bounds(farm_polygon_geojson)
+        if bounds is None:
+            return 0, height, 0, width
+
+        min_lon, min_lat, max_lon, max_lat = bounds
+        corners_wgs84 = [
+            (min_lon, min_lat),
+            (min_lon, max_lat),
+            (max_lon, min_lat),
+            (max_lon, max_lat),
+        ]
+        rows: List[float] = []
+        cols: List[float] = []
+        for lon, lat in corners_wgs84:
+            x, y = wgs84_to_raster_crs(lon, lat, crs_epsg)
+            r_frac, c_frac = transform.xy_to_fractional_pixel(x, y)
+            rows.append(r_frac)
+            cols.append(c_frac)
+
+        r_min = max(0, min(height, int(math.floor(min(rows))) - padding_px))
+        r_max = max(0, min(height, int(math.ceil(max(rows))) + padding_px))
+        c_min = max(0, min(width, int(math.floor(min(cols))) - padding_px))
+        c_max = max(0, min(width, int(math.ceil(max(cols))) + padding_px))
+
+        if r_max <= r_min or c_max <= c_min:
+            # If polygon does not overlap or is sub-pixel, clamp to nearest valid pixel window
+            r_min = max(0, min(height - 1, int(round(sum(rows) / len(rows)))))
+            r_max = min(height, r_min + 1)
+            c_min = max(0, min(width - 1, int(round(sum(cols) / len(cols)))))
+            c_max = min(width, c_min + 1)
+
+        return r_min, r_max, c_min, c_max
+
+    @classmethod
+    def _decode_window_from_reader(
+        cls,
+        endian: str,
+        ifds: List[Dict[int, Any]],
+        fetch_bytes_fn: Any,
+        band_name: str = "BAND",
+        overview_level: int = 0,
+        farm_polygon_geojson: Optional[Dict[str, Any]] = None,
+        window_bounds_wgs84: Optional[Tuple[float, float, float, float]] = None,
+        strict_crs: bool = False,
+    ) -> RasterBandData:
+        if overview_level < 0 or overview_level >= len(ifds):
+            raise RasterIntegrityError(
+                f"Requested overview_level={overview_level} is not available (file has {len(ifds)} IFDs)"
+            )
+
+        primary_tags = ifds[0]
+        target_tags = ifds[overview_level]
+        width, height, crs_epsg, transform, nodata_val, px_fmt, px_bytes, compression = (
+            cls._extract_georef_metadata(primary_tags, target_tags, strict_crs=strict_crs)
+        )
+
+        use_window = (farm_polygon_geojson is not None) or (window_bounds_wgs84 is not None)
+        r_min, r_max, c_min, c_max = cls._compute_pixel_window(
             width=width,
             height=height,
             crs_epsg=crs_epsg,
             transform=transform,
+            farm_polygon_geojson=farm_polygon_geojson,
+            window_bounds_wgs84=window_bounds_wgs84,
+        )
+        win_h = r_max - r_min
+        win_w = c_max - c_min
+
+        win_origin_x = transform.origin_x + c_min * transform.pixel_width + r_min * transform.row_rotation
+        win_origin_y = transform.origin_y + c_min * transform.col_rotation + r_min * transform.pixel_height
+        win_transform = (
+            GeoTransform(
+                origin_x=win_origin_x,
+                pixel_width=transform.pixel_width,
+                row_rotation=transform.row_rotation,
+                origin_y=win_origin_y,
+                col_rotation=transform.col_rotation,
+                pixel_height=transform.pixel_height,
+            )
+            if use_window
+            else transform
+        )
+
+        grid: List[List[float]] = [[float("nan") for _ in range(win_w)] for _ in range(win_h)]
+
+        def _decompress_block(raw_chunk: bytes) -> bytes:
+            if compression in (8, 32946):
+                try:
+                    return zlib.decompress(raw_chunk)
+                except Exception as exc:
+                    raise RasterIntegrityError(f"Corrupted DEFLATE stream in GeoTIFF: {exc}") from exc
+            if compression == 1:
+                return raw_chunk
+            raise RasterIntegrityError(f"Unsupported TIFF compression method: {compression}")
+
+        if cls.TAG_TILE_OFFSETS in target_tags:
+            tile_w = int(target_tags.get(cls.TAG_TILE_WIDTH, 0))
+            tile_h = int(target_tags.get(cls.TAG_TILE_LENGTH, 0))
+            if tile_w <= 0 or tile_h <= 0:
+                raise RasterIntegrityError(f"Invalid TileWidth={tile_w} or TileLength={tile_h}")
+
+            offsets = target_tags[cls.TAG_TILE_OFFSETS]
+            byte_counts = target_tags.get(cls.TAG_TILE_BYTE_COUNTS)
+            if not isinstance(offsets, list):
+                offsets = [offsets]
+            if not isinstance(byte_counts, list):
+                byte_counts = [byte_counts] if byte_counts is not None else []
+            if len(offsets) != len(byte_counts) or not offsets:
+                raise RasterIntegrityError("Mismatched or empty TileOffsets / TileByteCounts in GeoTIFF")
+
+            tiles_across = (width + tile_w - 1) // tile_w
+            tiles_down = (height + tile_h - 1) // tile_h
+            if len(offsets) < tiles_across * tiles_down:
+                raise RasterIntegrityError(
+                    f"TileOffsets count ({len(offsets)}) is less than expected tile grid ({tiles_across * tiles_down})"
+                )
+
+            ty_min = r_min // tile_h
+            ty_max = (r_max - 1) // tile_h
+            tx_min = c_min // tile_w
+            tx_max = (c_max - 1) // tile_w
+
+            tile_vals = tile_w * tile_h
+            expected_tile_bytes = tile_vals * px_bytes
+
+            for ty in range(ty_min, ty_max + 1):
+                for tx in range(tx_min, tx_max + 1):
+                    tile_idx = ty * tiles_across + tx
+                    off = int(offsets[tile_idx])
+                    bc = int(byte_counts[tile_idx])
+                    if off < 8 or bc <= 0:
+                        raise RasterIntegrityError(
+                            f"Invalid tile byte range offset={off}, byte_count={bc} for tile {tile_idx}"
+                        )
+                    raw_chunk = fetch_bytes_fn(off, off + bc - 1)
+                    if len(raw_chunk) < bc:
+                        raise RasterDownloadInterruptedError(
+                            f"Incomplete tile {tile_idx}: expected {bc} bytes at offset {off}, got {len(raw_chunk)}"
+                        )
+                    chunk = _decompress_block(raw_chunk[:bc])
+                    if len(chunk) < expected_tile_bytes:
+                        raise RasterIntegrityError(
+                            f"Decompressed tile {tile_idx} has {len(chunk)} bytes, expected {expected_tile_bytes}"
+                        )
+                    unpacked = struct.unpack(f"{endian}{tile_vals}{px_fmt}", chunk[:expected_tile_bytes])
+
+                    tile_row_origin = ty * tile_h
+                    tile_col_origin = tx * tile_w
+                    r_start = max(r_min, tile_row_origin)
+                    r_end = min(r_max, tile_row_origin + tile_h)
+                    c_start = max(c_min, tile_col_origin)
+                    c_end = min(c_max, tile_col_origin + tile_w)
+
+                    for gr in range(r_start, r_end):
+                        tr = gr - tile_row_origin
+                        row_target = grid[gr - r_min]
+                        base_idx = tr * tile_w
+                        for gc in range(c_start, c_end):
+                            tc = gc - tile_col_origin
+                            row_target[gc - c_min] = float(unpacked[base_idx + tc])
+
+        elif cls.TAG_STRIP_OFFSETS in target_tags:
+            offsets = target_tags[cls.TAG_STRIP_OFFSETS]
+            byte_counts = target_tags.get(cls.TAG_STRIP_BYTE_COUNTS)
+            rows_per_strip = int(target_tags.get(cls.TAG_ROWS_PER_STRIP, height))
+            if rows_per_strip <= 0:
+                raise RasterIntegrityError(f"Invalid RowsPerStrip={rows_per_strip}")
+            if not isinstance(offsets, list):
+                offsets = [offsets]
+            if not isinstance(byte_counts, list):
+                byte_counts = [byte_counts] if byte_counts is not None else []
+            if len(offsets) != len(byte_counts) or not offsets:
+                raise RasterIntegrityError("Mismatched or empty StripOffsets / StripByteCounts in GeoTIFF")
+
+            current_row = 0
+            for strip_idx, (off_raw, bc_raw) in enumerate(zip(offsets, byte_counts)):
+                off = int(off_raw)
+                bc = int(bc_raw)
+                rows_in_this_strip = min(rows_per_strip, height - current_row)
+                strip_r_start = current_row
+                strip_r_end = current_row + rows_in_this_strip
+                current_row = strip_r_end
+
+                # Skip strips completely outside the target window
+                if strip_r_end <= r_min or strip_r_start >= r_max:
+                    continue
+
+                if off < 8 or bc <= 0:
+                    raise RasterIntegrityError(
+                        f"Invalid strip byte range offset={off}, byte_count={bc} for strip {strip_idx}"
+                    )
+                raw_chunk = fetch_bytes_fn(off, off + bc - 1)
+                if len(raw_chunk) < bc:
+                    raise RasterDownloadInterruptedError(
+                        f"Incomplete strip {strip_idx}: expected {bc} bytes at offset {off}, got {len(raw_chunk)}"
+                    )
+                chunk = _decompress_block(raw_chunk[:bc])
+                expected_vals = rows_in_this_strip * width
+                if len(chunk) < expected_vals * px_bytes:
+                    raise RasterIntegrityError(
+                        f"Decompressed strip {strip_idx} has {len(chunk)} bytes, expected {expected_vals * px_bytes}"
+                    )
+                unpacked = struct.unpack(f"{endian}{expected_vals}{px_fmt}", chunk[: expected_vals * px_bytes])
+
+                ov_r_start = max(r_min, strip_r_start)
+                ov_r_end = min(r_max, strip_r_end)
+                for gr in range(ov_r_start, ov_r_end):
+                    r_local = gr - strip_r_start
+                    row_slice = unpacked[r_local * width + c_min : r_local * width + c_max]
+                    grid[gr - r_min] = [float(v) for v in row_slice]
+        else:
+            raise RasterIntegrityError("GeoTIFF contains neither StripOffsets nor TileOffsets")
+
+        return RasterBandData(
+            band_name=band_name,
+            width=win_w,
+            height=win_h,
+            crs_epsg=crs_epsg,
+            transform=win_transform,
             values=grid,
             nodata_value=nodata_val,
-            spatial_resolution_m=scale_x,
+            spatial_resolution_m=abs(win_transform.pixel_width),
         )
+
+    @classmethod
+    def read_geotiff(
+        cls,
+        source_path_or_url: str,
+        band_name: str = "BAND",
+        farm_polygon_geojson: Optional[Dict[str, Any]] = None,
+        window_bounds_wgs84: Optional[Tuple[float, float, float, float]] = None,
+        overview_level: int = 0,
+        http_client: Optional[RemoteCogHttpClient] = None,
+        require_range_support: bool = False,
+        max_unranged_bytes: int = 8 * 1024 * 1024,
+        strict_crs: bool = False,
+    ) -> RasterBandData:
+        """
+        Read a GeoTIFF or Cloud-Optimized GeoTIFF from a local file path or HTTP(S) URL.
+        - For remote URLs, uses `RemoteCogHttpClient` to perform HTTP Range requests (`bytes=start-end`)
+          for the TIFF header/IFD and ONLY the internal tiles/strips intersecting `farm_polygon_geojson`
+          or `window_bounds_wgs84`.
+        - Never downloads a fixed 16 MB prefix or silently truncates remote files.
+        """
+        if not isinstance(source_path_or_url, str) or not source_path_or_url.strip():
+            raise InvalidAssetUrlError("Raster source path or URL must be a non-empty string")
+
+        is_http = source_path_or_url.startswith("http://") or source_path_or_url.startswith("https://")
+        if "://" in source_path_or_url and not is_http:
+            raise InvalidAssetUrlError(f"Unsupported URL scheme in {source_path_or_url!r}")
+
+        if is_http:
+            owns_client = http_client is None
+            client = http_client or RemoteCogHttpClient(
+                require_range_support=require_range_support,
+                max_unranged_bytes=max_unranged_bytes,
+            )
+            try:
+                def _remote_fetch(start: int, end: int) -> bytes:
+                    return client.fetch_range(source_path_or_url, start, end)
+
+                endian, ifds = cls._parse_ifd_chain_from_reader(_remote_fetch, strict_crs=strict_crs)
+                return cls._decode_window_from_reader(
+                    endian=endian,
+                    ifds=ifds,
+                    fetch_bytes_fn=_remote_fetch,
+                    band_name=band_name,
+                    overview_level=overview_level,
+                    farm_polygon_geojson=farm_polygon_geojson,
+                    window_bounds_wgs84=window_bounds_wgs84,
+                    strict_crs=strict_crs,
+                )
+            finally:
+                if owns_client:
+                    client.close()
+
+        # Local file path
+        if not os.path.exists(source_path_or_url):
+            raise InvalidAssetUrlError(f"Local raster file does not exist: {source_path_or_url!r}")
+
+        with open(source_path_or_url, "rb") as f:
+            file_bytes = f.read()
+
+        return cls.parse_geotiff_bytes(
+            data=file_bytes,
+            band_name=band_name,
+            farm_polygon_geojson=farm_polygon_geojson,
+            window_bounds_wgs84=window_bounds_wgs84,
+            overview_level=overview_level,
+            strict_crs=strict_crs,
+        )
+
+    @classmethod
+    def parse_geotiff_bytes(
+        cls,
+        data: bytes,
+        band_name: str = "BAND",
+        farm_polygon_geojson: Optional[Dict[str, Any]] = None,
+        window_bounds_wgs84: Optional[Tuple[float, float, float, float]] = None,
+        overview_level: int = 0,
+        strict_crs: bool = False,
+    ) -> RasterBandData:
+        """Parse binary TIFF / GeoTIFF bytes with full IFD, CRS, tile/strip, and integrity validation."""
+        def _mem_fetch(start: int, end: int) -> bytes:
+            if start < 0 or start >= len(data):
+                return b""
+            return data[start : min(len(data), end + 1)]
+
+        endian, ifds = cls._parse_ifd_chain_from_reader(_mem_fetch, strict_crs=strict_crs)
+        return cls._decode_window_from_reader(
+            endian=endian,
+            ifds=ifds,
+            fetch_bytes_fn=_mem_fetch,
+            band_name=band_name,
+            overview_level=overview_level,
+            farm_polygon_geojson=farm_polygon_geojson,
+            window_bounds_wgs84=window_bounds_wgs84,
+            strict_crs=strict_crs,
+        )
+
 
 
 # ==============================================================================
@@ -1405,17 +2342,36 @@ def process_sentinel2_raster_bands(
     8. Vectorizes actual anomalous pixels into connected-component GeoJSON anomaly polygons.
     """
     required_keys = ("B02", "B04", "B05", "B06", "B08", "B8A", "B11", "SCL")
+    if not isinstance(band_sources, dict):
+        raise MissingBandError("band_sources must be a dictionary of Sentinel-2 band assets")
+
+    missing_keys = [
+        k for k in required_keys
+        if k not in band_sources or band_sources[k] is None or (isinstance(band_sources[k], str) and not band_sources[k].strip())
+    ]
+    if missing_keys:
+        raise MissingBandError(
+            f"Missing required Sentinel-2 spectral band assets: {', '.join(missing_keys)}"
+        )
+
     loaded_bands: Dict[str, RasterBandData] = {}
-    for key in required_keys:
-        if key not in band_sources:
-            raise ValueError(f"Missing required Sentinel-2 band: {key}")
-        src = band_sources[key]
-        if isinstance(src, RasterBandData):
-            loaded_bands[key] = src
-        elif isinstance(src, str):
-            loaded_bands[key] = GeoTiffCogProcessor.read_geotiff(src, band_name=key)
-        else:
-            raise TypeError(f"Unsupported band source type for {key}: {type(src)}")
+    with RemoteCogHttpClient() as shared_http_client:
+        for key in required_keys:
+            src = band_sources[key]
+            if isinstance(src, RasterBandData):
+                validate_supported_crs(src.crs_epsg)
+                loaded_bands[key] = src
+            elif isinstance(src, str):
+                is_remote = src.startswith("http://") or src.startswith("https://")
+                loaded_bands[key] = GeoTiffCogProcessor.read_geotiff(
+                    src,
+                    band_name=key,
+                    farm_polygon_geojson=farm_polygon_geojson if is_remote else None,
+                    http_client=shared_http_client if is_remote else None,
+                )
+            else:
+                raise TypeError(f"Unsupported band source type for {key}: {type(src)}")
+
 
     # Reference 10m grid comes from B08 (10m NIR)
     ref_band = loaded_bands["B08"]
