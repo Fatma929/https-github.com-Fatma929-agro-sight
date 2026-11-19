@@ -14,17 +14,278 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.time.Instant
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.concurrent.TimeUnit
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+enum class StacAcquisitionStatus(val labelAr: String, val isUsableLiveScene: Boolean) {
+    VALID_SCENE_WITH_BAND_ASSETS("مشهد حي صالح مع تحقق كامل من القنوات الطيفية (LIVE)", true),
+    NO_MATCHING_SCENES("استجابة STAC ناجحة ولكن لا توجد مشاهد مطابقة للنطاق/التاريخ", false),
+    MISSING_OR_INACCESSIBLE_ASSETS("تم العثور على المشهد ولكن بعض ملفات القنوات الطيفية مفقودة", false),
+    INVALID_GEOMETRY("إحداثيات أو مضلع جغرافي (GeoJSON) غير صالح", false),
+    NETWORK_OR_HTTP_FAILURE("تعذر الاتصال بخادم STAC (وضع DEMO الاحتياطي مفعل)", false)
+}
+
+data class Sentinel2BandAssets(
+    val b02Blue10mHref: String = "",
+    val b04Red10mHref: String = "",
+    val b05RedEdge1_20mHref: String = "",
+    val b06RedEdge2_20mHref: String = "",
+    val b08Nir10mHref: String = "",
+    val b8aNarrowNir20mHref: String = "",
+    val b11Swir16_20mHref: String = "",
+    val sclCloudMask20mHref: String = "",
+    val visualPreviewHref: String = ""
+) {
+    val hasAllRequiredSpectralBands: Boolean
+        get() = b02Blue10mHref.isNotBlank() &&
+            b04Red10mHref.isNotBlank() &&
+            b05RedEdge1_20mHref.isNotBlank() &&
+            b06RedEdge2_20mHref.isNotBlank() &&
+            b08Nir10mHref.isNotBlank() &&
+            b8aNarrowNir20mHref.isNotBlank() &&
+            b11Swir16_20mHref.isNotBlank()
+}
+
+data class TemporalSatelliteObservation(
+    val sceneId: String,
+    val acquisitionDateIso: String,
+    val cloudCoverPct: Float,
+    val isCloudGappedOrUnusable: Boolean,
+    val observedNdviMean: Float?,
+    val observedNdreMean: Float?,
+    val observedNdmiMean: Float?,
+    val observedPsriMean: Float?,
+    val qualityNoteAr: String
+)
+
+data class TemporalChangeAnalysis(
+    val observations: List<TemporalSatelliteObservation>,
+    val validObservationCount: Int,
+    val cloudGappedCount: Int,
+    val ndviChangeVsPrevious: Float?,
+    val ndreChangeVsPrevious: Float?,
+    val ndmiChangeVsPrevious: Float?,
+    val temporalTrendSummaryAr: String,
+    val coverageGapDisclaimerAr: String
+)
+
+/**
+ * Pixel-level multi-band reflectance sample for a 10m Sentinel-2 grid cell (after resampling 20m bands to 10m).
+ * Reflectance values are Bottom-Of-Atmosphere (L2A BOA) in range [0.0, 1.0].
+ * [sclClass] follows ESA Sentinel-2 L2A Scene Classification Layer specification:
+ * 0=NoData, 1=Saturated/Defective, 2=Dark Area, 3=Cloud Shadow, 4=Vegetation, 5=Not-Vegetated,
+ * 6=Water, 7=Unclassified, 8=Cloud Medium Prob, 9=Cloud High Prob, 10=Thin Cirrus, 11=Snow.
+ */
+data class Sentinel2PixelReflectance(
+    val row: Int,
+    val col: Int,
+    val b02Blue: Float,
+    val b04Red: Float,
+    val b05RedEdge1: Float,
+    val b06RedEdge2: Float,
+    val b08Nir: Float,
+    val b8aNarrowNir: Float,
+    val b11Swir1: Float,
+    val sclClass: Int = 4
+)
+
+data class ComputedPixelIndices(
+    val row: Int,
+    val col: Int,
+    val isValidUnmasked: Boolean,
+    val maskReason: String?,
+    val ndvi: Float?,
+    val ndre: Float?,
+    val ndmi: Float?,
+    val psri: Float?
+)
+
+data class SpectralRasterStatistics(
+    val totalPixels: Int,
+    val validPixels: Int,
+    val cloudOrNoDataMaskedPixels: Int,
+    val validPixelRatio: Float,
+    val ndviMean: Float,
+    val ndviStdDev: Float,
+    val ndreMean: Float,
+    val ndmiMean: Float,
+    val psriMean: Float,
+    val dataQualityIndicatorAr: String,
+    val geoJsonAnomalyPolygon: String
+)
+
+/**
+ * Scientifically rigorous Sentinel-2 spectral band math and cloud/NoData masking engine.
+ * Formula definitions:
+ * - NDVI = (B08 - B04) / (B08 + B04)
+ * - NDRE = (B8A - B05) / (B8A + B05)
+ * - NDMI = (B08 - B11) / (B08 + B11)
+ * - PSRI = (B04 - B02) / B06
+ */
+object Sentinel2BandMathEngine {
+
+    private val MASKED_SCL_CLASSES = setOf(0, 1, 3, 8, 9, 10, 11)
+    private const val EPSILON = 1e-6f
+
+    fun convertDnToReflectance(rawDn: Int, scaleFactor: Float = 0.0001f, offset: Float = 0.0f): Float {
+        if (rawDn <= 0) return Float.NaN
+        return (rawDn * scaleFactor + offset)
+    }
+
+    fun isCloudOrNoDataScl(sclClass: Int): Boolean = sclClass in MASKED_SCL_CLASSES
+
+    fun isValidReflectance(value: Float): Boolean =
+        !value.isNaN() && !value.isInfinite() && value in 0.0001f..1.0f
+
+    fun computeNormalizedDifference(bandA: Float, bandB: Float): Float? {
+        if (!isValidReflectance(bandA) || !isValidReflectance(bandB)) return null
+        val denom = bandA + bandB
+        if (kotlin.math.abs(denom) < EPSILON) return null
+        return ((bandA - bandB) / denom).coerceIn(-1.0f, 1.0f)
+    }
+
+    fun computePsri(b04Red: Float, b02Blue: Float, b06RedEdge2: Float): Float? {
+        if (!isValidReflectance(b04Red) || !isValidReflectance(b02Blue) || !isValidReflectance(b06RedEdge2)) {
+            return null
+        }
+        if (kotlin.math.abs(b06RedEdge2) < EPSILON) return null
+        return ((b04Red - b02Blue) / b06RedEdge2).coerceIn(-1.0f, 1.5f)
+    }
+
+    fun evaluatePixel(sample: Sentinel2PixelReflectance): ComputedPixelIndices {
+        if (isCloudOrNoDataScl(sample.sclClass)) {
+            return ComputedPixelIndices(
+                row = sample.row,
+                col = sample.col,
+                isValidUnmasked = false,
+                maskReason = "SCL_MASKED_CLASS_${sample.sclClass}",
+                ndvi = null,
+                ndre = null,
+                ndmi = null,
+                psri = null
+            )
+        }
+
+        val ndvi = computeNormalizedDifference(sample.b08Nir, sample.b04Red)
+        val ndre = computeNormalizedDifference(sample.b8aNarrowNir, sample.b05RedEdge1)
+        val ndmi = computeNormalizedDifference(sample.b08Nir, sample.b11Swir1)
+        val psri = computePsri(sample.b04Red, sample.b02Blue, sample.b06RedEdge2)
+
+        if (ndvi == null || ndre == null || ndmi == null || psri == null) {
+            return ComputedPixelIndices(
+                row = sample.row,
+                col = sample.col,
+                isValidUnmasked = false,
+                maskReason = "INVALID_BAND_REFLECTANCE_OR_ZERO_DENOMINATOR",
+                ndvi = ndvi,
+                ndre = ndre,
+                ndmi = ndmi,
+                psri = psri
+            )
+        }
+
+        return ComputedPixelIndices(
+            row = sample.row,
+            col = sample.col,
+            isValidUnmasked = true,
+            maskReason = null,
+            ndvi = ndvi,
+            ndre = ndre,
+            ndmi = ndmi,
+            psri = psri
+        )
+    }
+
+    fun aggregateRasterGrid(
+        samples: List<Sentinel2PixelReflectance>,
+        fieldLat: Double,
+        fieldLon: Double
+    ): SpectralRasterStatistics {
+        if (samples.isEmpty()) {
+            return SpectralRasterStatistics(
+                totalPixels = 0,
+                validPixels = 0,
+                cloudOrNoDataMaskedPixels = 0,
+                validPixelRatio = 0f,
+                ndviMean = Float.NaN,
+                ndviStdDev = Float.NaN,
+                ndreMean = Float.NaN,
+                ndmiMean = Float.NaN,
+                psriMean = Float.NaN,
+                dataQualityIndicatorAr = "لا توجد بكسلات متاحة",
+                geoJsonAnomalyPolygon = "{\"type\":\"FeatureCollection\",\"features\":[]}"
+            )
+        }
+
+        val evaluated = samples.map { evaluatePixel(it) }
+        val valid = evaluated.filter { it.isValidUnmasked }
+        val maskedCount = evaluated.size - valid.size
+        val validRatio = valid.size.toFloat() / evaluated.size.toFloat()
+
+        if (valid.isEmpty()) {
+            return SpectralRasterStatistics(
+                totalPixels = evaluated.size,
+                validPixels = 0,
+                cloudOrNoDataMaskedPixels = maskedCount,
+                validPixelRatio = 0f,
+                ndviMean = Float.NaN,
+                ndviStdDev = Float.NaN,
+                ndreMean = Float.NaN,
+                ndmiMean = Float.NaN,
+                psriMean = Float.NaN,
+                dataQualityIndicatorAr = "مرفوض بسبب الغطاء السحابي الكامل أو فقدان القنوات (0% بكسلات صالحة)",
+                geoJsonAnomalyPolygon = "{\"type\":\"FeatureCollection\",\"features\":[]}"
+            )
+        }
+
+        val ndviList = valid.mapNotNull { it.ndvi }
+        val ndreList = valid.mapNotNull { it.ndre }
+        val ndmiList = valid.mapNotNull { it.ndmi }
+        val psriList = valid.mapNotNull { it.psri }
+
+        val ndviMean = ndviList.average().toFloat()
+        val ndviVariance = ndviList.map { (it - ndviMean) * (it - ndviMean) }.average().toFloat()
+        val ndviStd = sqrt(max(0f, ndviVariance))
+        val ndreMean = ndreList.average().toFloat()
+        val ndmiMean = ndmiList.average().toFloat()
+        val psriMean = psriList.average().toFloat()
+
+        val qualityLabel = when {
+            validRatio >= 0.90f -> "جودة عالية (${(validRatio * 100).roundToInt()}% بكسلات خالية من السحب)"
+            validRatio >= 0.65f -> "جودة متوسطة (${(validRatio * 100).roundToInt()}% بكسلات صالحة - قناع سحب جزئي)"
+            else -> "جودة منخفضة (${(validRatio * 100).roundToInt()}% بكسلات صالحة - غطاء سحابي كثيف)"
+        }
+
+        val d = 0.0015
+        val geoJson = """
+            {"type":"FeatureCollection","features":[{"type":"Feature","properties":{"ndviMean":${formatDecimal2(ndviMean)},"ndreMean":${formatDecimal2(ndreMean)},"ndmiMean":${formatDecimal2(ndmiMean)},"psriMean":${formatDecimal2(psriMean)},"validPixelRatio":${formatDecimal2(validRatio)}},"geometry":{"type":"Polygon","coordinates":[[[${formatCoord4(fieldLon - d)},${formatCoord4(fieldLat - d)}],[${formatCoord4(fieldLon + d)},${formatCoord4(fieldLat - d)}],[${formatCoord4(fieldLon + d)},${formatCoord4(fieldLat + d)}],[${formatCoord4(fieldLon - d)},${formatCoord4(fieldLat + d)}],[${formatCoord4(fieldLon - d)},${formatCoord4(fieldLat - d)}]]]}}]}
+        """.trimIndent()
+
+        return SpectralRasterStatistics(
+            totalPixels = evaluated.size,
+            validPixels = valid.size,
+            cloudOrNoDataMaskedPixels = maskedCount,
+            validPixelRatio = validRatio,
+            ndviMean = ndviMean,
+            ndviStdDev = ndviStd,
+            ndreMean = ndreMean,
+            ndmiMean = ndmiMean,
+            psriMean = psriMean,
+            dataQualityIndicatorAr = qualityLabel,
+            geoJsonAnomalyPolygon = geoJson
+        )
+    }
+}
 
 interface SatelliteTelemetryDataSource {
     suspend fun fetchLiveOpenSourceSatelliteAndNasaData(
@@ -35,7 +296,7 @@ interface SatelliteTelemetryDataSource {
 
 /**
  * Represents a live open-source communication channel (Satellite / Meteorology / Soil / Messaging)
- * with verifiable endpoint URL, latency, HTTP status, and academic/institutional citation.
+ * with verifiable endpoint URL, measured latency, actual HTTP status, data mode, and citation.
  */
 data class OpenSourceChannelStatus(
     val id: String,
@@ -47,12 +308,13 @@ data class OpenSourceChannelStatus(
     val httpStatusCode: Int,
     val latencyMs: Long,
     val lastSyncedIso: String,
-    val licenseAndCitationAr: String
+    val licenseAndCitationAr: String,
+    val dataMode: TelemetryDataMode = if (isConnected) TelemetryDataMode.LIVE else TelemetryDataMode.DEMO_ESTIMATED
 )
 
 /**
- * Holds real retrieved satellite optical imagery (Bitmap) + STAC Sentinel-2 Level-2A scene metadata
- * and NASA POWER agro-climatology telemetry for the active farm coordinates.
+ * Holds retrieved satellite optical imagery (Bitmap) + STAC Sentinel-2 Level-2A scene metadata,
+ * verified spectral band asset links, temporal observations, and NASA POWER agro-climatology telemetry.
  */
 data class RealSatelliteAndNasaTelemetry(
     val sceneId: String,
@@ -72,7 +334,15 @@ data class RealSatelliteAndNasaTelemetry(
     val nasaRelativeHumidityPct: Float,
     val nasaWindSpeed2mMs: Float,
     val nasaVaporPressureDeficitKpa: Float,
-    val channels: List<OpenSourceChannelStatus>
+    val channels: List<OpenSourceChannelStatus>,
+    val stacAcquisitionStatus: StacAcquisitionStatus = StacAcquisitionStatus.NETWORK_OR_HTTP_FAILURE,
+    val bandAssets: Sentinel2BandAssets = Sentinel2BandAssets(),
+    val temporalAnalysis: TemporalChangeAnalysis? = null,
+    val spatialResolutionLabelAr: String = "10m (B02/B04/B08) & 20m resampled to 10m (B05/B06/B8A/B11/SCL)",
+    val processingTimestampIso: String = Instant.now().toString(),
+    val dataQualityIndicatorAr: String = "DEMO / محاكاة طيفية استرشادية",
+    val processingMethodAr: String = "Copernicus Sentinel-2 L2A STAC + SCL Cloud Masking",
+    val dataMode: TelemetryDataMode = TelemetryDataMode.DEMO_ESTIMATED
 )
 
 /**
@@ -82,7 +352,6 @@ data class ScientificFormulaCalculationAudit(
     val cropNameAr: String,
     val latitude: Double,
     val longitude: Double,
-    // Step 1: Penman-Monteith ET0 parameters
     val netRadiationRnMjM2: Float,
     val saturationVaporPressureEsKpa: Float,
     val actualVaporPressureEaKpa: Float,
@@ -92,7 +361,6 @@ data class ScientificFormulaCalculationAudit(
     val windSpeed2mU2Ms: Float,
     val calculatedPenmanEt0MmDay: Float,
     val openMeteoEt0MmDay: Float,
-    // Step 2: Satellite-derived & Climate-adjusted Kc
     val meanSentinelNdvi: Float,
     val meanSentinelNdre: Float,
     val meanSentinelNdwi: Float,
@@ -100,22 +368,20 @@ data class ScientificFormulaCalculationAudit(
     val climateAdjustedFaoKc: Float,
     val satelliteDerivedKc: Float,
     val fusedAuthoritativeKc: Float,
-    // Step 3: Net Crop Evapotranspiration (ETc) & Effective Precipitation (Pe)
     val effectivePrecipitationMm: Float,
     val netEtcMmDay: Float,
     val netWaterM3PerFeddanDay: Float,
-    // Step 4: Soil Salinity Leaching Fraction (LR) & pH Factor
     val waterSalinityEcwDsM: Float,
     val cropThresholdEceDsM: Float,
     val leachingFractionRatio: Float,
     val leachingPercentage: Int,
-    // Step 5: Gross Irrigation Requirement (GIR) & Valve Flow
     val systemApplicationEfficiencyRatio: Float,
     val grossIrrigationMmDay: Float,
     val grossWaterM3PerFeddanDay: Float,
     val totalFarmDailyWaterM3: Float,
     val valveOperatingHoursPerSector: Float,
-    val citations: List<ScientificCitationItem>
+    val citations: List<ScientificCitationItem>,
+    val inputProvenanceSummaryAr: String = "ET₀: Open-Meteo FAO-56 | التربة: بيانات مدخلة بواسطة المستخدم | المؤشرات الطيفية: Sentinel-2 L2A"
 )
 
 data class ScientificCitationItem(
@@ -134,20 +400,13 @@ class OpenSourceSatelliteClient(
         .build()
 ) : SatelliteTelemetryDataSource {
 
-    /**
-     * Establishes live communication with open-source earth observation & meteorological APIs:
-     * 1. Element84 Earth Search STAC API v1 (Copernicus Sentinel-2 L2A catalog metadata)
-     * 2. NASA POWER Agroclimatology API (DAV / Solar Radiation, Root Zone Soil Moisture, VPD, T2M)
-     * 3. Esri World Imagery / Copernicus Sentinel-2 Open Optical Tile Server (Real Satellite Bitmap)
-     * 4. Open-Meteo FAO-56 Penman-Monteith Agrometeorological API
-     */
     override suspend fun fetchLiveOpenSourceSatelliteAndNasaData(
         latitude: Double,
         longitude: Double
     ): RealSatelliteAndNasaTelemetry = withContext(Dispatchers.IO) {
-        val nowIso = LocalDate.now().toString()
+        val nowIso = Instant.now().toString().take(19).replace('T', ' ')
 
-        // 1. Query Element84 Earth Search STAC API for Sentinel-2 Level-2A scene at (lon, lat)
+        // 1. Query Element84 Earth Search STAC API for Sentinel-2 Level-2A scenes & band assets
         val stacResult = fetchSentinel2StacScene(latitude, longitude)
 
         // 2. Query NASA POWER Agroclimatology API for solar radiation & root-zone parameters
@@ -156,8 +415,15 @@ class OpenSourceSatelliteClient(
         // 3. Download real high-resolution overhead satellite imagery bitmap for the farm coordinates
         val zoom = 15
         val (tileX, tileY) = latLonToWebMercatorTile(latitude, longitude, zoom)
-        val tileUrl = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$zoom/$tileY/$tileX"
+        val tileUrl = if (stacResult.bandAssets.visualPreviewHref.startsWith("https://")) {
+            stacResult.bandAssets.visualPreviewHref
+        } else {
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$zoom/$tileY/$tileX"
+        }
         val (satBitmap, tileStatus, tileLatency) = fetchRealSatelliteTileBitmap(tileUrl)
+
+        // 4. Probe Open-Meteo status dynamically instead of hardcoding HTTP 200 / 142ms
+        val (meteoConnected, meteoCode, meteoLatency) = probeOpenMeteoEndpoint(latitude, longitude)
 
         val channels = listOf(
             OpenSourceChannelStatus(
@@ -165,12 +431,13 @@ class OpenSourceSatelliteClient(
                 nameAr = "قناة القمر الصناعي الأوروبي Sentinel-2 L2A (STAC API)",
                 platformNameEn = "Copernicus Sentinel-2 L2A via Element84 Earth Search STAC v1",
                 endpointUrl = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
-                protocolAr = "HTTPS REST / GeoJSON STAC Item Search",
-                isConnected = stacResult.isLive,
+                protocolAr = "HTTPS REST / GeoJSON STAC Item & COG Band Asset Search",
+                isConnected = stacResult.status.isUsableLiveScene,
                 httpStatusCode = stacResult.httpCode,
                 latencyMs = stacResult.latencyMs,
                 lastSyncedIso = stacResult.acquisitionDateIso,
-                licenseAndCitationAr = "European Space Agency (ESA) Copernicus Open Access Hub • CC-BY-SA 3.0 IGO"
+                licenseAndCitationAr = "European Space Agency (ESA) Copernicus Open Access Hub • CC-BY-SA 3.0 IGO",
+                dataMode = if (stacResult.status.isUsableLiveScene) TelemetryDataMode.LIVE else TelemetryDataMode.DEMO_ESTIMATED
             ),
             OpenSourceChannelStatus(
                 id = "nasa_power_agro",
@@ -181,8 +448,9 @@ class OpenSourceSatelliteClient(
                 isConnected = nasaResult.isLive,
                 httpStatusCode = nasaResult.httpCode,
                 latencyMs = nasaResult.latencyMs,
-                lastSyncedIso = nowIso,
-                licenseAndCitationAr = "NASA LaRC POWER Project (Prediction Of Worldwide Energy Resources) • Open Government Data"
+                lastSyncedIso = nasaResult.latestObservationDateIso,
+                licenseAndCitationAr = "NASA LaRC POWER Project (Prediction Of Worldwide Energy Resources) • Open Government Data",
+                dataMode = if (nasaResult.isLive) TelemetryDataMode.LIVE else TelemetryDataMode.DEMO_ESTIMATED
             ),
             OpenSourceChannelStatus(
                 id = "open_meteo_fao56",
@@ -190,30 +458,51 @@ class OpenSourceSatelliteClient(
                 platformNameEn = "Open-Meteo Agrometeorological Forecast API (ECMWF IFS / DWD ICON)",
                 endpointUrl = "https://api.open-meteo.com/v1/forecast?daily=et0_fao_evapotranspiration",
                 protocolAr = "HTTPS JSON • WMO / FAO-56 Penman-Monteith Hourly & Daily",
-                isConnected = true,
-                httpStatusCode = 200,
-                latencyMs = 142L,
+                isConnected = meteoConnected,
+                httpStatusCode = meteoCode,
+                latencyMs = meteoLatency,
                 lastSyncedIso = nowIso,
-                licenseAndCitationAr = "Open-Meteo.com & Copernicus ERA5-Land Reanalysis • CC-BY 4.0 Open-Source License"
+                licenseAndCitationAr = "Open-Meteo.com & Copernicus ERA5-Land Reanalysis • CC-BY 4.0 Open-Source License",
+                dataMode = if (meteoConnected) TelemetryDataMode.LIVE else TelemetryDataMode.DEMO_ESTIMATED
             ),
             OpenSourceChannelStatus(
                 id = "satellite_optical_tiles",
-                nameAr = "خادم المرئيات الفضائية البصرية عالية الدقة (WMTS Satellite Tiles)",
-                platformNameEn = "Open Geospatial WMTS World Imagery & Sentinel-2 Cloudless Mosaic",
+                nameAr = "خادم المرئيات الفضائية البصرية عالية الدقة (WMTS / STAC Preview)",
+                platformNameEn = "Open Geospatial WMTS World Imagery & Sentinel-2 True-Color Asset",
                 endpointUrl = tileUrl,
-                protocolAr = "WMTS Slippy Map Tile ($zoom/$tileY/$tileX)",
+                protocolAr = "HTTPS Raster Preview / WMTS Tile ($zoom/$tileY/$tileX)",
                 isConnected = satBitmap != null,
                 httpStatusCode = tileStatus,
                 latencyMs = tileLatency,
                 lastSyncedIso = nowIso,
-                licenseAndCitationAr = "ESA Sentinel-2 Cloudless (EOX IT Services GmbH) & Esri Open Basemap Attribution"
+                licenseAndCitationAr = "ESA Sentinel-2 Cloudless & Esri Open Basemap Attribution",
+                dataMode = if (satBitmap != null) TelemetryDataMode.LIVE else TelemetryDataMode.DEMO_ESTIMATED
             )
         )
+
+        val overallMode = if (stacResult.status.isUsableLiveScene) {
+            TelemetryDataMode.LIVE
+        } else {
+            TelemetryDataMode.DEMO_ESTIMATED
+        }
+
+        val dataQualityAr = when (stacResult.status) {
+            StacAcquisitionStatus.VALID_SCENE_WITH_BAND_ASSETS ->
+                "[LIVE] مشهد Sentinel-2 L2A موثق (${stacResult.sceneId}) • نسبة السحب ${formatDecimal1(stacResult.cloudCoverPct)}% • 7 قنوات طيفية + قناع SCL متوفرة"
+            StacAcquisitionStatus.NO_MATCHING_SCENES ->
+                "[DEMO FALLBACK] استجابة STAC فارغة لهذه الإحداثيات — يتم عرض نموذج طيفي تجريبي (DEMO)"
+            StacAcquisitionStatus.MISSING_OR_INACCESSIBLE_ASSETS ->
+                "[DEMO FALLBACK] المشهد ${stacResult.sceneId} ينقصه بعض ملفات القنوات الطيفية — يتم عرض نموذج DEMO"
+            StacAcquisitionStatus.INVALID_GEOMETRY ->
+                "[INVALID GEOMETRY] إحداثيات الحقل خارج النطاق الجغرافي الصالح"
+            StacAcquisitionStatus.NETWORK_OR_HTTP_FAILURE ->
+                "[DEMO / OFFLINE] تعذر الاتصال بخادم STAC (HTTP ${stacResult.httpCode}) — يتم عرض وضع المحاكاة التجريبي (DEMO)"
+        }
 
         RealSatelliteAndNasaTelemetry(
             sceneId = stacResult.sceneId,
             acquisitionDateIso = stacResult.acquisitionDateIso,
-            constellationAr = "Sentinel-2A / Sentinel-2B MSI (13 قناة طيفية بدقة 10م)",
+            constellationAr = "Sentinel-2A / Sentinel-2B MSI (L2A BOA • B02/B04/B05/B06/B08/B8A/B11 + SCL)",
             mgrsTileId = stacResult.mgrsTile,
             cloudCoverPct = stacResult.cloudCoverPct,
             platformInstrument = "MultiSpectral Instrument (MSI) Level-2A Bottom-Of-Atmosphere",
@@ -228,28 +517,56 @@ class OpenSourceSatelliteClient(
             nasaRelativeHumidityPct = nasaResult.rhPct,
             nasaWindSpeed2mMs = nasaResult.wind2mMs,
             nasaVaporPressureDeficitKpa = nasaResult.vpdKpa,
-            channels = channels
+            channels = channels,
+            stacAcquisitionStatus = stacResult.status,
+            bandAssets = stacResult.bandAssets,
+            temporalAnalysis = stacResult.temporalAnalysis,
+            processingTimestampIso = nowIso,
+            dataQualityIndicatorAr = dataQualityAr,
+            processingMethodAr = if (stacResult.status.isUsableLiveScene) {
+                "LIVE STAC COG Discovery + SCL Cloud Filter + Multi-Temporal Comparison"
+            } else {
+                "DEMO Mode Spatial Simulation (Fallback)"
+            },
+            dataMode = overallMode
         )
     }
 
-    private data class StacQueryOutcome(
-        val isLive: Boolean,
+    internal data class StacQueryOutcome(
+        val status: StacAcquisitionStatus,
         val httpCode: Int,
         val latencyMs: Long,
         val sceneId: String,
         val acquisitionDateIso: String,
         val mgrsTile: String,
-        val cloudCoverPct: Float
+        val cloudCoverPct: Float,
+        val bandAssets: Sentinel2BandAssets,
+        val temporalAnalysis: TemporalChangeAnalysis
     )
 
-    private fun fetchSentinel2StacScene(lat: Double, lon: Double): StacQueryOutcome {
+    internal fun fetchSentinel2StacScene(lat: Double, lon: Double): StacQueryOutcome {
+        if (lat.isNaN() || lon.isNaN() || lat !in -90.0..90.0 || lon !in -180.0..180.0) {
+            return StacQueryOutcome(
+                status = StacAcquisitionStatus.INVALID_GEOMETRY,
+                httpCode = 400,
+                latencyMs = 0L,
+                sceneId = "INVALID_GEOMETRY",
+                acquisitionDateIso = LocalDate.now().toString(),
+                mgrsTile = "N/A",
+                cloudCoverPct = 100f,
+                bandAssets = Sentinel2BandAssets(),
+                temporalAnalysis = buildEmptyTemporalAnalysis("إحداثيات جغرافية غير صالحة")
+            )
+        }
+
         val startMs = System.currentTimeMillis()
         val delta = 0.02
         val bbox = "${lon - delta},${lat - delta},${lon + delta},${lat + delta}"
-        val url = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items?bbox=$bbox&limit=1"
+        // Fetch up to 6 recent observations to support Phase 3 Temporal Satellite Intelligence
+        val url = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items?bbox=$bbox&limit=6"
 
         val defaultMgrs = deriveEgyptianMgrsTile(lat, lon)
-        val fallbackSceneId = "S2B_MSIL2A_${LocalDate.now().minusDays(2).format(DateTimeFormatter.BASIC_ISO_DATE)}T083609_N0510_R064_T${defaultMgrs}"
+        val demoSceneId = "DEMO_S2B_MSIL2A_${LocalDate.now().minusDays(2).format(DateTimeFormatter.BASIC_ISO_DATE)}_T${defaultMgrs}"
 
         return try {
             val req = Request.Builder()
@@ -257,73 +574,188 @@ class OpenSourceSatelliteClient(
                 .header("Accept", "application/geo+json, application/json")
                 .build()
             httpClient.newCall(req).execute().use { res ->
-                val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(45L)
+                val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
                 if (!res.isSuccessful) {
                     return StacQueryOutcome(
-                        isLive = false,
+                        status = StacAcquisitionStatus.NETWORK_OR_HTTP_FAILURE,
                         httpCode = res.code,
                         latencyMs = elapsed,
-                        sceneId = fallbackSceneId,
+                        sceneId = demoSceneId,
                         acquisitionDateIso = LocalDate.now().minusDays(2).toString(),
                         mgrsTile = defaultMgrs,
-                        cloudCoverPct = 1.4f
+                        cloudCoverPct = 0f,
+                        bandAssets = Sentinel2BandAssets(),
+                        temporalAnalysis = buildEmptyTemporalAnalysis("تعذر جلب السلسلة الزمنية من STAC (HTTP ${res.code})")
                     )
                 }
                 val body = res.body?.string().orEmpty()
-                val json = JSONObject(body)
-                val features = json.optJSONArray("features")
-                if (features != null && features.length() > 0) {
-                    val item = features.getJSONObject(0)
-                    val id = item.optString("id", fallbackSceneId)
-                    val props = item.optJSONObject("properties")
-                    val dt = props?.optString("datetime", "")?.take(10)
-                        ?.ifBlank { LocalDate.now().minusDays(2).toString() }
-                        ?: LocalDate.now().minusDays(2).toString()
-                    val cloud = props?.optDouble("eo:cloud_cover", 1.2)?.toFloat() ?: 1.2f
-                    val gridCode = props?.optString("grid:code", "MGRS-$defaultMgrs")
-                        ?.removePrefix("MGRS-") ?: defaultMgrs
-
-                    StacQueryOutcome(
-                        isLive = true,
-                        httpCode = res.code,
-                        latencyMs = elapsed,
-                        sceneId = id,
-                        acquisitionDateIso = dt,
-                        mgrsTile = gridCode,
-                        cloudCoverPct = cloud.coerceIn(0f, 100f)
-                    )
-                } else {
-                    StacQueryOutcome(
-                        isLive = true,
-                        httpCode = 200,
-                        latencyMs = elapsed,
-                        sceneId = fallbackSceneId,
-                        acquisitionDateIso = LocalDate.now().minusDays(2).toString(),
-                        mgrsTile = defaultMgrs,
-                        cloudCoverPct = 0.8f
-                    )
-                }
+                parseStacFeatureCollectionJson(
+                    body = body,
+                    httpCode = res.code,
+                    elapsedMs = elapsed,
+                    defaultMgrs = defaultMgrs,
+                    demoSceneId = demoSceneId
+                )
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
-            val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(80L)
+        } catch (e: Exception) {
+            val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
             StacQueryOutcome(
-                isLive = false,
-                httpCode = 200,
+                status = StacAcquisitionStatus.NETWORK_OR_HTTP_FAILURE,
+                httpCode = 0,
                 latencyMs = elapsed,
-                sceneId = fallbackSceneId,
+                sceneId = demoSceneId,
                 acquisitionDateIso = LocalDate.now().minusDays(2).toString(),
                 mgrsTile = defaultMgrs,
-                cloudCoverPct = 1.1f
+                cloudCoverPct = 0f,
+                bandAssets = Sentinel2BandAssets(),
+                temporalAnalysis = buildEmptyTemporalAnalysis("انقطاع الاتصال بخادم STAC (${e.javaClass.simpleName})")
             )
         }
+    }
+
+    internal fun parseStacFeatureCollectionJson(
+        body: String,
+        httpCode: Int,
+        elapsedMs: Long,
+        defaultMgrs: String,
+        demoSceneId: String
+    ): StacQueryOutcome {
+        val json = JSONObject(body)
+        val features = json.optJSONArray("features")
+        if (features == null || features.length() == 0) {
+            return StacQueryOutcome(
+                status = StacAcquisitionStatus.NO_MATCHING_SCENES,
+                httpCode = httpCode,
+                latencyMs = elapsedMs,
+                sceneId = "NO_MATCHING_SCENE_$defaultMgrs",
+                acquisitionDateIso = LocalDate.now().toString(),
+                mgrsTile = defaultMgrs,
+                cloudCoverPct = 100f,
+                bandAssets = Sentinel2BandAssets(),
+                temporalAnalysis = buildEmptyTemporalAnalysis("لا توجد مشاهد Sentinel-2 مطابقة في نافذة البحث")
+            )
+        }
+
+        val temporalObservations = mutableListOf<TemporalSatelliteObservation>()
+        var bestFeatureIndex = 0
+        var lowestCloudCover = Float.MAX_VALUE
+
+        for (i in 0 until features.length()) {
+            val item = features.optJSONObject(i) ?: continue
+            val id = item.optString("id", "S2_SCENE_$i")
+            val props = item.optJSONObject("properties")
+            val dt = props?.optString("datetime", "")?.take(10).orEmpty().ifBlank { "Unknown" }
+            val cloud = props?.optDouble("eo:cloud_cover", 100.0)?.toFloat()?.coerceIn(0f, 100f) ?: 100f
+            val isCloudGapped = cloud > 35.0f
+
+            if (cloud < lowestCloudCover) {
+                lowestCloudCover = cloud
+                bestFeatureIndex = i
+            }
+
+            temporalObservations.add(
+                TemporalSatelliteObservation(
+                    sceneId = id,
+                    acquisitionDateIso = dt,
+                    cloudCoverPct = cloud,
+                    isCloudGappedOrUnusable = isCloudGapped,
+                    observedNdviMean = null,
+                    observedNdreMean = null,
+                    observedNdmiMean = null,
+                    observedPsriMean = null,
+                    qualityNoteAr = if (isCloudGapped) {
+                        "مستبعد من مقارنة التدهور النباتي بسبب الغطاء السحابي (${formatDecimal1(cloud)}%)"
+                    } else {
+                        "مشهد صالح للمقارنة الزمنية (سحب ${formatDecimal1(cloud)}%)"
+                    }
+                )
+            )
+        }
+
+        val primaryItem = features.getJSONObject(bestFeatureIndex)
+        val sceneId = primaryItem.optString("id", demoSceneId)
+        val props = primaryItem.optJSONObject("properties")
+        val dt = props?.optString("datetime", "")?.take(10)
+            ?.ifBlank { LocalDate.now().minusDays(2).toString() }
+            ?: LocalDate.now().minusDays(2).toString()
+        val cloud = props?.optDouble("eo:cloud_cover", 0.0)?.toFloat()?.coerceIn(0f, 100f) ?: 0f
+        val gridCode = props?.optString("grid:code", "MGRS-$defaultMgrs")
+            ?.removePrefix("MGRS-") ?: defaultMgrs
+
+        val assetsObj = primaryItem.optJSONObject("assets")
+        fun assetHref(vararg keys: String): String {
+            if (assetsObj == null) return ""
+            for (k in keys) {
+                val href = assetsObj.optJSONObject(k)?.optString("href", "").orEmpty()
+                if (href.isNotBlank()) return href
+            }
+            return ""
+        }
+
+        val bandAssets = Sentinel2BandAssets(
+            b02Blue10mHref = assetHref("blue", "B02"),
+            b04Red10mHref = assetHref("red", "B04"),
+            b05RedEdge1_20mHref = assetHref("rededge1", "B05"),
+            b06RedEdge2_20mHref = assetHref("rededge2", "B06"),
+            b08Nir10mHref = assetHref("nir", "B08"),
+            b8aNarrowNir20mHref = assetHref("nir08", "B8A"),
+            b11Swir16_20mHref = assetHref("swir16", "B11"),
+            sclCloudMask20mHref = assetHref("scl", "SCL"),
+            visualPreviewHref = assetHref("thumbnail", "visual")
+        )
+
+        val status = if (bandAssets.hasAllRequiredSpectralBands) {
+            StacAcquisitionStatus.VALID_SCENE_WITH_BAND_ASSETS
+        } else {
+            StacAcquisitionStatus.MISSING_OR_INACCESSIBLE_ASSETS
+        }
+
+        val validCount = temporalObservations.count { !it.isCloudGappedOrUnusable }
+        val cloudGapCount = temporalObservations.count { it.isCloudGappedOrUnusable }
+        val temporalSummary = TemporalChangeAnalysis(
+            observations = temporalObservations,
+            validObservationCount = validCount,
+            cloudGappedCount = cloudGapCount,
+            ndviChangeVsPrevious = null,
+            ndreChangeVsPrevious = null,
+            ndmiChangeVsPrevious = null,
+            temporalTrendSummaryAr = "تم رصد ${temporalObservations.size} مشاهد في أرشيف Sentinel-2 ($validCount صالحة، $cloudGapCount مستبعدة بسبب السحب >35%).",
+            coverageGapDisclaimerAr = "ملاحظة علمية: الفجوات الزمنية الناتجة عن الغطاء السحابي تُستبعد تلقائياً ولا تُفسر كتدهور في الغطاء النباتي."
+        )
+
+        return StacQueryOutcome(
+            status = status,
+            httpCode = httpCode,
+            latencyMs = elapsedMs,
+            sceneId = sceneId,
+            acquisitionDateIso = dt,
+            mgrsTile = gridCode,
+            cloudCoverPct = cloud,
+            bandAssets = bandAssets,
+            temporalAnalysis = temporalSummary
+        )
+    }
+
+    private fun buildEmptyTemporalAnalysis(reasonAr: String): TemporalChangeAnalysis {
+        return TemporalChangeAnalysis(
+            observations = emptyList(),
+            validObservationCount = 0,
+            cloudGappedCount = 0,
+            ndviChangeVsPrevious = null,
+            ndreChangeVsPrevious = null,
+            ndmiChangeVsPrevious = null,
+            temporalTrendSummaryAr = reasonAr,
+            coverageGapDisclaimerAr = "لا تُفسر المشاهد المفقودة أو الغائمة كتدهور في صحة المحصول."
+        )
     }
 
     private data class NasaPowerOutcome(
         val isLive: Boolean,
         val httpCode: Int,
         val latencyMs: Long,
+        val latestObservationDateIso: String,
         val solarRadMjM2: Float,
         val clearSkyMjM2: Float,
         val rootZoneMoisturePct: Float,
@@ -336,7 +768,6 @@ class OpenSourceSatelliteClient(
 
     private fun fetchNasaPowerAgroclimatology(lat: Double, lon: Double): NasaPowerOutcome {
         val startMs = System.currentTimeMillis()
-        // Query recent 5-day window from NASA POWER Agroclimatology API
         val endDate = LocalDate.now().minusDays(2)
         val startDate = endDate.minusDays(5)
         val fmt = DateTimeFormatter.BASIC_ISO_DATE
@@ -357,43 +788,50 @@ class OpenSourceSatelliteClient(
                 .header("Accept", "application/json")
                 .build()
             httpClient.newCall(req).execute().use { res ->
-                val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(60L)
+                val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
                 if (!res.isSuccessful) {
-                    return fallback.copy(httpCode = res.code, latencyMs = elapsed)
+                    return fallback.copy(isLive = false, httpCode = res.code, latencyMs = elapsed)
                 }
                 val body = res.body?.string().orEmpty()
                 val json = JSONObject(body)
                 val paramObj = json.optJSONObject("properties")?.optJSONObject("parameter")
-                    ?: return fallback.copy(latencyMs = elapsed)
+                    ?: return fallback.copy(isLive = false, httpCode = res.code, latencyMs = elapsed)
 
-                fun extractLatestValid(paramName: String, defaultVal: Float): Float {
+                var latestDateKey = endDate.toString()
+                fun extractLatestValid(paramName: String, defaultVal: Float, minValid: Float, maxValid: Float): Float {
                     val series = paramObj.optJSONObject(paramName) ?: return defaultVal
                     val keys = series.keys().asSequence().toList().sortedDescending()
                     for (k in keys) {
                         val v = series.optDouble(k, -999.0).toFloat()
-                        if (v > -90f) return v
+                        if (v in minValid..maxValid) {
+                            if (k.length == 8) {
+                                latestDateKey = "${k.substring(0, 4)}-${k.substring(4, 6)}-${k.substring(6, 8)}"
+                            }
+                            return v
+                        }
                     }
                     return defaultVal
                 }
 
-                val swDwn = extractLatestValid("ALLSKY_SFC_SW_DWN", fallback.solarRadMjM2)
-                val clrSw = extractLatestValid("CLRSKY_SFC_SW_DWN", fallback.clearSkyMjM2)
-                val tMax = extractLatestValid("T2M_MAX", fallback.tMaxC)
-                val tMin = extractLatestValid("T2M_MIN", fallback.tMinC)
-                val rh = extractLatestValid("RH2M", fallback.rhPct).coerceIn(12f, 95f)
-                val ws2m = extractLatestValid("WS2M", fallback.wind2mMs).coerceIn(0.5f, 15f)
-                val gwetRoot = (extractLatestValid("GWETROOT", 0.44f) * 100f).coerceIn(18f, 88f)
+                val swDwn = extractLatestValid("ALLSKY_SFC_SW_DWN", fallback.solarRadMjM2, 0.5f, 45.0f)
+                val clrSw = extractLatestValid("CLRSKY_SFC_SW_DWN", fallback.clearSkyMjM2, 0.5f, 45.0f)
+                val tMax = extractLatestValid("T2M_MAX", fallback.tMaxC, -20.0f, 58.0f)
+                val tMin = extractLatestValid("T2M_MIN", fallback.tMinC, -25.0f, tMax)
+                val rh = extractLatestValid("RH2M", fallback.rhPct, 5.0f, 100.0f)
+                val ws2m = extractLatestValid("WS2M", fallback.wind2mMs, 0.1f, 35.0f)
+                val gwetRoot = (extractLatestValid("GWETROOT", 0.44f, 0.01f, 1.0f) * 100f).coerceIn(5f, 98f)
 
                 val esMax = 0.6108f * exp((17.27f * tMax) / (tMax + 237.3f))
                 val esMin = 0.6108f * exp((17.27f * tMin) / (tMin + 237.3f))
                 val es = (esMax + esMin) / 2f
                 val ea = es * (rh / 100f)
-                val vpd = max(0.35f, es - ea)
+                val vpd = max(0.25f, es - ea)
 
                 NasaPowerOutcome(
                     isLive = true,
                     httpCode = res.code,
                     latencyMs = elapsed,
+                    latestObservationDateIso = latestDateKey,
                     solarRadMjM2 = swDwn,
                     clearSkyMjM2 = clrSw,
                     rootZoneMoisturePct = gwetRoot,
@@ -407,8 +845,8 @@ class OpenSourceSatelliteClient(
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(95L)
-            fallback.copy(latencyMs = elapsed)
+            val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            fallback.copy(isLive = false, httpCode = 0, latencyMs = elapsed)
         }
     }
 
@@ -424,8 +862,9 @@ class OpenSourceSatelliteClient(
         val vpd = max(0.4f, es - ea)
         return NasaPowerOutcome(
             isLive = false,
-            httpCode = 200,
-            latencyMs = 115L,
+            httpCode = 0,
+            latencyMs = 0L,
+            latestObservationDateIso = "${LocalDate.now().minusDays(2)} (DEMO/ESTIMATED)",
             solarRadMjM2 = 24.2f + southShift * 0.35f,
             clearSkyMjM2 = 26.5f + southShift * 0.35f,
             rootZoneMoisturePct = 44.5f,
@@ -437,6 +876,23 @@ class OpenSourceSatelliteClient(
         )
     }
 
+    private fun probeOpenMeteoEndpoint(lat: Double, lon: Double): Triple<Boolean, Int, Long> {
+        val startMs = System.currentTimeMillis()
+        val url = "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&daily=et0_fao_evapotranspiration&forecast_days=1"
+        return try {
+            val req = Request.Builder().url(url).build()
+            httpClient.newCall(req).execute().use { res ->
+                val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+                Triple(res.isSuccessful, res.code, elapsed)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            Triple(false, 0, elapsed)
+        }
+    }
+
     private fun fetchRealSatelliteTileBitmap(url: String): Triple<Bitmap?, Int, Long> {
         val startMs = System.currentTimeMillis()
         return try {
@@ -445,7 +901,7 @@ class OpenSourceSatelliteClient(
                 .header("User-Agent", "AgroSight-Precision-Irrigation/2.5 (Android; OpenSource-EO)")
                 .build()
             httpClient.newCall(req).execute().use { res ->
-                val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(35L)
+                val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
                 if (!res.isSuccessful) return Triple(null, res.code, elapsed)
                 val bytes = res.body?.bytes() ?: return Triple(null, res.code, elapsed)
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
@@ -454,8 +910,8 @@ class OpenSourceSatelliteClient(
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(50L)
-            Triple(null, 200, elapsed)
+            val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            Triple(null, 0, elapsed)
         }
     }
 
@@ -472,18 +928,14 @@ class OpenSourceSatelliteClient(
 
         fun deriveEgyptianMgrsTile(lat: Double, lon: Double): String {
             return when {
-                lat >= 30.6 && lon >= 31.5 -> "36RUV" // East Delta / Salhia
-                lat >= 30.0 && lon < 31.0 -> "35RQQ"  // Wadi El Natrun / Moghra
-                lat in 26.5..29.9 && lon < 29.5 -> "35RLK" // Farafra Oasis
-                lat < 24.5 -> "36QUL" // Toshka / Aswan
+                lat >= 30.6 && lon >= 31.5 -> "36RUV"
+                lat >= 30.0 && lon < 31.0 -> "35RQQ"
+                lat in 26.5..29.9 && lon < 29.5 -> "35RLK"
+                lat < 24.5 -> "36QUL"
                 else -> "36RUU"
             }
         }
 
-        /**
-         * Performs the full scientific mathematical derivation for the current farm, crop,
-         * meteorological telemetry, and multi-spectral satellite scan, citing every formula and open-data source.
-         */
         fun computeScientificFormulaAudit(
             crop: CropSpec,
             latitude: Double,
@@ -507,63 +959,45 @@ class OpenSourceSatelliteClient(
             irrigationSystem: IrrigationSystemType,
             valveFlowRateM3PerFeddanHr: Float
         ): ScientificFormulaCalculationAudit {
-            // 1. FAO-56 Penman-Monteith Step-by-Step Derivation
             val tMean = (tempMaxC + tempMinC) / 2f
-            // Wind speed at 2m height (u2) from 10m wind speed (FAO-56 Eq. 47)
             val u10Ms = windSpeed10mKmh / 3.6f
             val u2Ms = (u10Ms * (4.87f / ln(67.8f * 10f - 5.42f))).coerceAtLeast(0.5f)
 
-            // Saturation Vapor Pressure e_s (kPa) - FAO-56 Eq. 11 & 12
             val e0Max = 0.6108f * exp((17.27f * tempMaxC) / (tempMaxC + 237.3f))
             val e0Min = 0.6108f * exp((17.27f * tempMinC) / (tempMinC + 237.3f))
             val esKpa = (e0Max + e0Min) / 2f
             val eaKpa = esKpa * (relativeHumidityPct.coerceIn(10, 98) / 100f)
             val vpdKpa = max(0.25f, esKpa - eaKpa)
 
-            // Slope of saturation vapor pressure curve Delta (kPa/°C) - FAO-56 Eq. 13
             val delta = (4098f * (0.6108f * exp((17.27f * tMean) / (tMean + 237.3f)))) /
                 (tMean + 237.3f).pow(2)
-
-            // Psychrometric constant gamma (kPa/°C) at standard elevation (~0.0665 kPa/°C)
             val gamma = 0.0665f
 
-            // Net radiation Rn (MJ/m²/day) from incoming solar radiation Rs (albedo alpha = 0.23)
             val rns = (1f - 0.23f) * solarRadiationMjM2
             val rnl = (2.4f + 0.05f * vpdKpa).coerceIn(1.8f, 4.8f)
             val rnMjM2 = max(4.0f, rns - rnl)
 
-            // FAO-56 Penman-Monteith Equation (Eq. 6):
-            // ET0 = [0.408 * Delta * (Rn - G) + gamma * (900 / (T + 273)) * u2 * (es - ea)] / [Delta + gamma * (1 + 0.34 * u2)]
             val radTerm = 0.408f * delta * rnMjM2
             val aeroTerm = gamma * (900f / (tMean + 273f)) * u2Ms * vpdKpa
             val denomTerm = delta + gamma * (1f + 0.34f * u2Ms)
             val penmanCalculatedEt0 = (radTerm + aeroTerm) / max(0.1f, denomTerm)
 
-            // Use authoritative Open-Meteo ET0 while showing the exact Penman-Monteith verification
             val authoritativeEt0 = openMeteoEt0MmDay.coerceIn(1.8f, 11.5f)
 
-            // 2. Crop Coefficient Kc: FAO-56 Arid Climate Adjustment (Eq. 62) + Sentinel-2 Spectral Kc
             val climateDeltaKc = (0.04f * (u2Ms - 2f) - 0.004f * (relativeHumidityPct - 45f)).coerceIn(-0.08f, 0.14f)
             val climateAdjustedKc = (tabularBaseKc + climateDeltaKc).coerceIn(0.25f, 1.35f)
-            // Calibrated Sentinel-2 NDVI-to-Kc relationship (Calera et al., 2017 / Manna Remote Sensing Model)
             val satelliteKc = (1.25f * meanNdvi + 0.10f).coerceIn(0.28f, 1.32f)
-            // Weighted fusion (60% phenology+climate + 40% live satellite canopy vigor)
             val fusedKc = ((climateAdjustedKc * 0.60f) + (satelliteKc * 0.40f)).coerceIn(0.28f, 1.35f)
 
-            // 3. Crop Evapotranspiration ETc & Effective Rainfall Pe (USDA SCS Method)
             val effectivePrecipMm = if (precipitationMm > 2.0f) (precipitationMm * 0.80f) else 0f
             val netEtcMm = max(0.8f, authoritativeEt0 * fusedKc - effectivePrecipMm)
-            // 1 Feddan = 4,200 m² -> 1 mm depth on 1 Feddan = 4.2 m³
             val netM3PerFeddan = netEtcMm * 4.2f
 
-            // 4. Salinity Leaching Requirement (LR) - Rhoades (1974) & FAO-29 Eq.
-            // LR = ECw / [5 * ECe_threshold - ECw] / LeachingEfficiency
             val lrDenom = max(1.2f, 5f * crop.salinityThresholdEce - waterEcwDsM)
             val rawLr = (waterEcwDsM / lrDenom) / soilTexture.leachingEfficiencyFactor
             val lrRatio = rawLr.coerceIn(0.05f, 0.42f)
             val lrPct = (lrRatio * 100f).roundToInt()
 
-            // 5. Gross Irrigation Requirement (GIR) & Valve Operating Hours
             val appEffRatio = (irrigationSystem.efficiencyPercent / 100f).coerceIn(0.60f, 0.96f)
             val grossMmDay = netEtcMm / (appEffRatio * (1f - lrRatio))
             val grossM3PerFeddan = grossMmDay * 4.2f
@@ -582,9 +1016,9 @@ class OpenSourceSatelliteClient(
                 ScientificCitationItem(
                     code = "Sentinel-2 L2A & FAO-56 Eq. 62",
                     titleAr = "اشتقاق معامل المحصول الفضائي والمناخي المدمج (Spectral & Climate-Adjusted Kc)",
-                    formulaLatexLike = "NDVI = (B08 - B04)/(B08 + B04)  |  Kc_sat = 1.25·NDVI + 0.10  |  Kc_adj = Kc_tab + [0.04(u2-2) - 0.004(RHmin-45)]",
+                    formulaLatexLike = "NDVI=(B08-B04)/(B08+B04) | NDRE=(B8A-B05)/(B8A+B05) | NDMI=(B08-B11)/(B08+B11) | PSRI=(B04-B02)/B06",
                     substitutedValuesAr = "NDVI=${formatDecimal2(meanNdvi)} ➔ Kc_sat=${formatDecimal2(satelliteKc)} | Kc_clim=${formatDecimal2(climateAdjustedKc)} ➔ Kc المعتمد = ${formatDecimal2(fusedKc)}",
-                    referenceSourceEn = "ESA Copernicus Sentinel-2 MSI Level-2A (B04 Red 665nm, B08 NIR 842nm, B05 Red-Edge 705nm) & Calera et al. (2017) Remote Sensing of Environment.",
+                    referenceSourceEn = "ESA Copernicus Sentinel-2 MSI Level-2A (B02 490nm, B04 665nm, B05 705nm, B06 740nm, B08 842nm, B8A 865nm, B11 1610nm) & Calera et al. (2017).",
                     openDataUrl = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a"
                 ),
                 ScientificCitationItem(
@@ -600,7 +1034,7 @@ class OpenSourceSatelliteClient(
                     titleAr = "المقنن المائي الإجمالي للفدان وزمن تشغيل المحبس (Gross Irrigation & Valve Run-Time)",
                     formulaLatexLike = "ETc = ET0 × Kc - Pe   |   GIR (م³/فدان) = [ (ETc × 4.2) / (Ea × (1 - LR)) ]   |   T_hrs = GIR / Q_feddan",
                     substitutedValuesAr = "ETc=${formatDecimal2(netEtcMm)} مم (${formatDecimal1(netM3PerFeddan)} م³ صافي) ÷ [كفاءة ${irrigationSystem.efficiencyPercent}% × (1 - ${formatDecimal2(lrRatio)})] ➔ ${formatDecimal1(grossM3PerFeddan)} م³/فدان/يوم",
-                    referenceSourceEn = "USDA-NRCS National Engineering Handbook Part 652 (Irrigation Guide) & Egyptian Ministry of Water Resources and Irrigation (MWRI) Feddan Conversion (1 Feddan = 4,200 m²).",
+                    referenceSourceEn = "USDA-NRCS National Engineering Handbook Part 652 & Egyptian MWRI Feddan Conversion (1 Feddan = 4,200 m²).",
                     openDataUrl = "https://www.fao.org/land-water/databases-and-software/cropwat"
                 )
             )

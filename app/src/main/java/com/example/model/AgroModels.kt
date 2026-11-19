@@ -834,3 +834,96 @@ fun buildSatelliteValveSectors(
         )
     }
 }
+
+/**
+ * Phase 5: Water Savings Analytics
+ * Distinguishes clearly between:
+ * - Potential modeled water savings (FAO-56 recommended schedule vs traditional surface/flood baseline)
+ * - Measured logged water savings (only when actual applied water m³ is logged in irrigation records)
+ */
+data class WaterSavingsAnalyticsSummary(
+    val traditionalBaselineWeeklyM3: Float,
+    val fao56RecommendedWeeklyM3: Float,
+    val potentialModeledSavingsWeeklyM3: Float,
+    val potentialModeledSavingsPercent: Int,
+    val hasMeasuredExecutionLogs: Boolean,
+    val measuredLoggedAppliedM3: Float,
+    val measuredSavingsM3: Float?,
+    val statusExplanationAr: String
+)
+
+fun computeWaterSavingsAnalytics(
+    weeklySchedule: List<WeeklyIrrigationDayItem>,
+    areaFeddans: Float,
+    loggedAppliedVolumesM3: List<Float>
+): WaterSavingsAnalyticsSummary {
+    val recommendedWeeklyM3 = weeklySchedule.sumOf { it.totalFarmM3.toDouble() }.toFloat()
+    // Traditional uncalibrated flood/surface baseline (~65% efficiency)
+    val traditionalWeeklyM3 = weeklySchedule.sumOf {
+        (it.netM3PerFeddan / 0.65f * areaFeddans).toDouble()
+    }.toFloat().coerceAtLeast(recommendedWeeklyM3)
+
+    val potentialSavingsM3 = max(0f, traditionalWeeklyM3 - recommendedWeeklyM3)
+    val potentialPct = if (traditionalWeeklyM3 > 0f) {
+        ((potentialSavingsM3 / traditionalWeeklyM3) * 100f).roundToInt().coerceIn(0, 65)
+    } else 0
+
+    val hasLogs = loggedAppliedVolumesM3.isNotEmpty()
+    val loggedTotalM3 = loggedAppliedVolumesM3.sum()
+    val measuredSavings = if (hasLogs) {
+        max(0f, traditionalWeeklyM3 - loggedTotalM3)
+    } else null
+
+    val explanation = if (hasLogs) {
+        "وفر فعلي موثق من سجلات التشغيل: ${formatDecimal1(measuredSavings ?: 0f)} م³ مقارنة بالري التقليدي، مع وفر نموذجي مستهدف ${potentialPct}% عبر جدولة FAO-56."
+    } else {
+        "وفر نموذجي محتمل (Potential Modeled Savings): ${formatDecimal1(potentialSavingsM3)} م³/أسبوع (${potentialPct}%) مقارنة بالري التقليدي؛ سجّل كميات الضخ الفعلية لحساب الوفر الفعلي المقاس."
+    }
+
+    return WaterSavingsAnalyticsSummary(
+        traditionalBaselineWeeklyM3 = traditionalWeeklyM3,
+        fao56RecommendedWeeklyM3 = recommendedWeeklyM3,
+        potentialModeledSavingsWeeklyM3 = potentialSavingsM3,
+        potentialModeledSavingsPercent = potentialPct,
+        hasMeasuredExecutionLogs = hasLogs,
+        measuredLoggedAppliedM3 = loggedTotalM3,
+        measuredSavingsM3 = measuredSavings,
+        statusExplanationAr = explanation
+    )
+}
+
+/**
+ * Phase 6: Soil Intelligence & Data Provenance
+ * Distinguishes between certified laboratory measurements, farmer field meter estimates,
+ * and regional baseline presets.
+ */
+enum class SoilDataProvenance(val labelAr: String, val confidenceNoteAr: String) {
+    CERTIFIED_LAB_ANALYSIS(
+        "تحليل معمل معتمد (Certified Lab)",
+        "بيانات مقاسة مخبرياً لعينات التربة والمياه؛ دقة عالية لتوصيات التسميد والغسيل"
+    ),
+    FIELD_PORTABLE_METER(
+        "قياس جهاز حقلي محمول (Field Meter)",
+        "قراءات حقلية مباشرة (pH / EC)؛ يوصى بمعايرة الجهاز دورياً"
+    ),
+    REGIONAL_BASELINE_ESTIMATE(
+        "تقدير إقليمي افتراضي (Regional Estimate)",
+        "قيم استرشادية مبنية على خصائص المنطقة الجغرافية؛ يوصى بإدخال تحليل معمل فعلي"
+    )
+}
+
+data class SoilLaboratorySample(
+    val sampleId: String,
+    val sampleDateIso: String,
+    val provenance: SoilDataProvenance,
+    val depthCm: Int = 30,
+    val ph: Float,
+    val eceDsM: Float,
+    val ecwDsM: Float,
+    val organicMatterPercent: Float = 1.2f,
+    val availableNitrogenPpm: Float = 45f,
+    val availablePhosphorusPpm: Float = 14f,
+    val availablePotassiumPpm: Float = 180f,
+    val soilTexture: SoilTexture
+)
+

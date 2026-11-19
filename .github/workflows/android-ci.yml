@@ -1,4 +1,4 @@
-name: Android CI & Security Rules Verification
+name: Android CI, Python Raster Backend & Firestore Security Rules Verification
 
 on:
   push:
@@ -21,6 +21,11 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      - name: Set up Python 3.11 for Sentinel-2 Raster Backend Tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Set up Node.js 20 for Firestore Security Rules tests
         uses: actions/setup-node@v4
         with:
@@ -32,7 +37,10 @@ jobs:
             cp .env.example .env
           fi
 
-      - name: Run Unit & Robolectric Tests
+      - name: Run Python Sentinel-2 Raster Backend Unit Tests
+        run: python3 -m unittest discover -s backend -p "test_*.py"
+
+      - name: Run Android Unit & Robolectric Tests
         run: gradle :app:testDebugUnitTest
 
       - name: Assemble Debug APK

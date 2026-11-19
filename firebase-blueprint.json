@@ -2,7 +2,7 @@
   "entities": {
     "FarmerCloudWorkspace": {
       "title": "FarmerCloudWorkspace",
-      "description": "Cloud-synced AgroSight farmer profile, RBAC role, account status, field geometry, soil chemistry, and latest satellite spectral telemetry.",
+      "description": "Cloud-synced AgroSight agricultural workspace storing RBAC role, account status, field geometry, soil chemistry, and satellite spectral telemetry. Separates authentication/contact PII (no National ID, phone, or email stored in this document).",
       "type": "object",
       "properties": {
         "userId": {
@@ -17,23 +17,11 @@
         "accountStatus": {
           "type": "string",
           "enum": ["ACTIVE", "SUSPENDED", "PENDING_VERIFICATION"],
-          "description": "Account lifecycle status managed by administrators."
+          "description": "Account lifecycle status managed by Super Administrators."
         },
         "farmerName": {
           "type": "string",
-          "description": "Arabic full name of the farmer."
-        },
-        "whatsappPhone": {
-          "type": "string",
-          "description": "Farmer WhatsApp number in +201xxxxxxxxx format."
-        },
-        "gmailAddress": {
-          "type": "string",
-          "description": "Farmer Gmail address."
-        },
-        "nationalId": {
-          "type": "string",
-          "description": "14-digit Egyptian National ID."
+          "description": "Display name of the farmer."
         },
         "fieldName": {
           "type": "string",
@@ -61,7 +49,7 @@
         },
         "soilPh": {
           "type": "number",
-          "description": "Soil pH level (4.0 - 9.5)."
+          "description": "Soil pH level (3.5 - 10.5)."
         },
         "soilEce": {
           "type": "number",
@@ -89,7 +77,7 @@
         },
         "detectedRiskName": {
           "type": "string",
-          "description": "Latest satellite-detected crop epidemiological diagnosis."
+          "description": "Latest satellite-detected crop epidemiological risk summary."
         },
         "createdAt": {
           "type": "string",
@@ -107,9 +95,6 @@
         "role",
         "accountStatus",
         "farmerName",
-        "whatsappPhone",
-        "gmailAddress",
-        "nationalId",
         "fieldName",
         "region",
         "cropType",
@@ -130,7 +115,7 @@
     },
     "CloudChatLog": {
       "title": "CloudChatLog",
-      "description": "Cloud-synced AI Agronomy Chatbot message or direct WhatsApp wa.me log owned by the signed-in farmer.",
+      "description": "Cloud-synced AI Agronomy Chatbot message owned by the signed-in farmer.",
       "type": "object",
       "properties": {
         "userId": {
@@ -218,13 +203,13 @@
       "schema": {
         "$ref": "#/entities/FarmerCloudWorkspace"
       },
-      "description": "User-scoped AgroSight cloud workspace document storing farmer profile, RBAC role, account status, field, soil chemistry, and satellite indices."
+      "description": "User-scoped AgroSight cloud workspace document storing agricultural profile, RBAC role, account status, field geometry, soil chemistry, and satellite indices (strictly excludes National ID, phone number, and raw email)."
     },
     "/users/{userId}/chat_logs/{logId}": {
       "schema": {
         "$ref": "#/entities/CloudChatLog"
       },
-      "description": "User-scoped subcollection storing Gemini Agronomy AI chat history, voice transcripts, search/maps grounded insights, and direct wa.me logs."
+      "description": "User-scoped subcollection storing Gemini Agronomy AI chat history and grounded insights."
     },
     "/admins/{adminUid}": {
       "schema": {

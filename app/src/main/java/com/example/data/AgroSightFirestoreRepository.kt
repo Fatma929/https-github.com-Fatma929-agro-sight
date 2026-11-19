@@ -94,6 +94,15 @@ fun handleFirestoreError(exception: Throwable, operationType: OperationType, pat
     return jsonString
 }
 
+/**
+ * Cloud-synced agricultural workspace stored in `/users/{userId}`.
+ *
+ * Security & Data Minimization Policy (Phase 10):
+ * - Separates authentication/personal identifiers from agricultural telemetry.
+ * - National IDs (`nationalId`), personal phone numbers (`whatsappPhone`), and raw email addresses
+ *   are NEVER uploaded to Firestore `/users/{userId}` documents and are never fabricated with zeros
+ *   or placeholder defaults.
+ */
 @Keep
 @IgnoreExtraProperties
 data class FarmerCloudWorkspace(
@@ -102,9 +111,6 @@ data class FarmerCloudWorkspace(
     val role: String = "FARMER",
     val accountStatus: String = "ACTIVE",
     val farmerName: String = "",
-    val whatsappPhone: String = "",
-    val gmailAddress: String = "",
-    val nationalId: String = "",
     val fieldName: String = "",
     val region: String = "",
     val cropType: String = "",
@@ -146,9 +152,9 @@ interface CloudWorkspaceRepository {
     suspend fun upsertFarmerWorkspace(
         userId: String,
         farmerName: String,
-        whatsappPhone: String,
-        gmailAddress: String,
-        nationalId: String,
+        whatsappPhone: String = "",
+        gmailAddress: String = "",
+        nationalId: String = "",
         fieldName: String,
         region: String,
         cropType: String,
@@ -176,6 +182,7 @@ interface CloudWorkspaceRepository {
         messageText: String,
         groundingSources: String
     ): Result<Unit>
+    suspend fun deleteCloudWorkspace(userId: String): Result<Unit> = Result.success(Unit)
 }
 
 class AgroSightFirestoreRepository(
@@ -310,19 +317,27 @@ class AgroSightFirestoreRepository(
             return Result.failure(IllegalStateException("UID mismatch"))
         }
 
+        // Strict input validation: reject invalid coordinates or out-of-range agronomic values
+        if (latitude.isNaN() || latitude !in -90.0..90.0 || longitude.isNaN() || longitude !in -180.0..180.0) {
+            return Result.failure(IllegalArgumentException("Invalid geographic coordinates"))
+        }
+        if (farmerName.trim().length < 2 || fieldName.trim().length < 2) {
+            return Result.failure(IllegalArgumentException("Farmer name and field name must be at least 2 characters"))
+        }
+
         val isVerifiedBootstrappedAdmin = currentAuthUser.isEmailVerified &&
             currentAuthUser.email?.equals(UserRole.BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) == true
         val initialRole = if (isVerifiedBootstrappedAdmin) "SUPER_ADMIN" else "FARMER"
 
+        // Security & Privacy Policy:
+        // Never upload nationalId, whatsappPhone, or gmailAddress to Firestore /users/{userId},
+        // and never fabricate missing national IDs with zeros or fake phone numbers.
         val docRef = firestore.collection("users").document(userId)
-        val safeNationalId = nationalId.filter { it.isDigit() }.padEnd(14, '0').take(14)
-        val safeName = farmerName.trim().ifBlank { "مزارع أجرو سايت" }.take(120)
-        val safePhone = whatsappPhone.trim().ifBlank { "+201012345678" }.take(24)
-        val safeGmail = gmailAddress.trim().ifBlank { "farmer@gmail.com" }.take(120)
-        val safeField = fieldName.trim().ifBlank { "مزرعة أجرو سايت" }.take(150)
-        val safeRegion = region.trim().ifBlank { "وادي النطرون" }.take(100)
-        val safeCrop = cropType.trim().ifBlank { "بطاطس" }.take(80)
-        val safeRisk = detectedRiskName.trim().ifBlank { "نمو خضري متوازن" }.take(200)
+        val safeName = farmerName.trim().take(120)
+        val safeField = fieldName.trim().take(150)
+        val safeRegion = region.trim().ifBlank { "غير محدد" }.take(100)
+        val safeCrop = cropType.trim().ifBlank { "غير محدد" }.take(80)
+        val safeRisk = detectedRiskName.trim().ifBlank { "غير محدد" }.take(200)
 
         return try {
             val existingSnap = docRef.get().await()
@@ -332,9 +347,6 @@ class AgroSightFirestoreRepository(
                     "role" to initialRole,
                     "accountStatus" to "ACTIVE",
                     "farmerName" to safeName,
-                    "whatsappPhone" to safePhone,
-                    "gmailAddress" to safeGmail,
-                    "nationalId" to safeNationalId,
                     "fieldName" to safeField,
                     "region" to safeRegion,
                     "cropType" to safeCrop,
@@ -356,9 +368,6 @@ class AgroSightFirestoreRepository(
             } else {
                 val updatePayload = mapOf(
                     "farmerName" to safeName,
-                    "whatsappPhone" to safePhone,
-                    "gmailAddress" to safeGmail,
-                    "nationalId" to safeNationalId,
                     "fieldName" to safeField,
                     "region" to safeRegion,
                     "cropType" to safeCrop,
@@ -453,6 +462,29 @@ class AgroSightFirestoreRepository(
             throw e
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.CREATE, "users/$userId/chat_logs/$logId")
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun deleteCloudWorkspace(userId: String): Result<Unit> {
+        val firestore = db ?: return Result.failure(IllegalStateException("Firestore not available"))
+        val uid = auth?.currentUser?.uid ?: return Result.failure(IllegalStateException("Not signed in"))
+        if (userId.isBlank()) return Result.failure(IllegalArgumentException("Blank userId"))
+        return try {
+            val chatDocs = firestore.collection("users").document(userId)
+                .collection("chat_logs")
+                .limit(50)
+                .get()
+                .await()
+            for (doc in chatDocs.documents) {
+                doc.reference.delete().await()
+            }
+            firestore.collection("users").document(userId).delete().await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.DELETE, "users/$userId")
             Result.failure(e)
         }
     }

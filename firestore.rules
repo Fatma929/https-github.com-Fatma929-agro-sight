@@ -36,21 +36,34 @@ service cloud.firestore {
              request.auth.token.email_verified == true;
     }
 
-    // RBAC Admin lookup: Bootstrapped Super Admin OR registered in /admins/{uid}
-    function isAdmin() {
-      return isBootstrappedSuperAdmin() ||
-             (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    function hasAdminDoc() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function adminDocRole() {
+      return get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role;
+    }
+
+    // Least-privilege RBAC tier checks: SUPER_ADMIN vs AGRONOMIST_ADMIN
+    function isSuperAdmin() {
+      return isBootstrappedSuperAdmin() || (hasAdminDoc() && adminDocRole() == 'SUPER_ADMIN');
+    }
+
+    function isAgronomistAdmin() {
+      return hasAdminDoc() && adminDocRole() == 'AGRONOMIST_ADMIN';
+    }
+
+    function isAnyAdmin() {
+      return isSuperAdmin() || isAgronomistAdmin();
     }
 
     // 3. Validation Blueprint: FarmerCloudWorkspace (/users/{userId})
+    // Phase 10 Mandatory Policy: Strictly prohibits nationalId, whatsappPhone, and gmailAddress in Firestore
     function isValidFarmerWorkspace(data, userId) {
       return data.userId is string && data.userId == userId &&
              data.role is string && data.role in ['SUPER_ADMIN', 'AGRONOMIST_ADMIN', 'FARMER'] &&
              data.accountStatus is string && data.accountStatus in ['ACTIVE', 'SUSPENDED', 'PENDING_VERIFICATION'] &&
              data.farmerName is string && data.farmerName.size() >= 2 && data.farmerName.size() <= 120 &&
-             data.whatsappPhone is string && data.whatsappPhone.size() >= 8 && data.whatsappPhone.size() <= 24 &&
-             data.gmailAddress is string && data.gmailAddress.size() >= 5 && data.gmailAddress.size() <= 120 &&
-             data.nationalId is string && data.nationalId.size() == 14 &&
              data.fieldName is string && data.fieldName.size() >= 2 && data.fieldName.size() <= 150 &&
              data.region is string && data.region.size() >= 2 && data.region.size() <= 100 &&
              data.cropType is string && data.cropType.size() >= 2 && data.cropType.size() <= 80 &&
@@ -90,39 +103,39 @@ service cloud.firestore {
     }
 
     match /admins/{adminUid} {
-      allow get: if (isOwner(adminUid) || isAdmin()) && isValidId(adminUid);
-      allow list: if isAdmin();
+      allow get: if (isOwner(adminUid) || isAnyAdmin()) && isValidId(adminUid);
+      allow list: if isSuperAdmin();
 
-      allow create: if isBootstrappedSuperAdmin() &&
+      allow create: if isSuperAdmin() &&
                        isValidId(adminUid) &&
                        incoming().keys().hasAll(['userId', 'email', 'role', 'grantedByUid', 'createdAt']) &&
                        incoming().keys().hasOnly(['userId', 'email', 'role', 'grantedByUid', 'createdAt']) &&
                        isValidAdminRegistryEntry(incoming(), adminUid);
 
-      allow update: if isBootstrappedSuperAdmin() &&
+      allow update: if isSuperAdmin() &&
                        isValidId(adminUid) &&
                        isValidAdminRegistryEntry(incoming(), adminUid) &&
                        incoming().userId == existing().userId &&
                        incoming().createdAt == existing().createdAt &&
                        incoming().diff(existing()).affectedKeys().hasOnly(['email', 'role', 'grantedByUid']);
 
-      allow delete: if isBootstrappedSuperAdmin() && isValidId(adminUid);
+      allow delete: if isSuperAdmin() && isValidId(adminUid);
     }
 
     match /users/{userId} {
-      allow get: if (isOwner(userId) || isAdmin()) && isValidId(userId);
-      allow list: if isOwner(userId) || isAdmin();
+      allow get: if (isOwner(userId) || isAnyAdmin()) && isValidId(userId);
+      allow list: if isOwner(userId) || isAnyAdmin();
 
       allow create: if isSignedIn() &&
                        isValidId(userId) &&
                        incoming().keys().hasAll([
-                         'userId', 'role', 'accountStatus', 'farmerName', 'whatsappPhone', 'gmailAddress', 'nationalId',
+                         'userId', 'role', 'accountStatus', 'farmerName',
                          'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
                          'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
                          'detectedRiskName', 'createdAt', 'updatedAt'
                        ]) &&
                        incoming().keys().hasOnly([
-                         'userId', 'role', 'accountStatus', 'farmerName', 'whatsappPhone', 'gmailAddress', 'nationalId',
+                         'userId', 'role', 'accountStatus', 'farmerName',
                          'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
                          'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
                          'detectedRiskName', 'createdAt', 'updatedAt'
@@ -131,8 +144,8 @@ service cloud.firestore {
                        (
                          // Standard owner self-registration: prevented from self-assigning admin roles
                          (isOwner(userId) && incoming().role == 'FARMER' && incoming().accountStatus == 'ACTIVE') ||
-                         // Bootstrapped Super Admin or Admin provisioning any role
-                         isAdmin()
+                         // Super Admin provisioning any role
+                         isSuperAdmin()
                        );
 
       allow update: if isSignedIn() &&
@@ -148,17 +161,26 @@ service cloud.firestore {
                            incoming().role == existing().role &&
                            incoming().accountStatus == existing().accountStatus &&
                            incoming().diff(existing()).affectedKeys().hasOnly([
-                             'farmerName', 'whatsappPhone', 'gmailAddress', 'nationalId',
-                             'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
+                             'farmerName', 'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
                              'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
                              'detectedRiskName', 'updatedAt'
                            ])
                          ) ||
-                         // Action 2: Admin RBAC & record management override
+                         // Action 2: AGRONOMIST_ADMIN updating agronomic & spectral advisory fields ONLY (cannot modify role/status/profile)
                          (
-                           isAdmin() &&
+                           isAgronomistAdmin() &&
+                           incoming().role == existing().role &&
+                           incoming().accountStatus == existing().accountStatus &&
                            incoming().diff(existing()).affectedKeys().hasOnly([
-                             'role', 'accountStatus', 'farmerName', 'whatsappPhone', 'gmailAddress', 'nationalId',
+                             'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
+                             'detectedRiskName', 'updatedAt'
+                           ])
+                         ) ||
+                         // Action 3: SUPER_ADMIN full RBAC & record management override
+                         (
+                           isSuperAdmin() &&
+                           incoming().diff(existing()).affectedKeys().hasOnly([
+                             'role', 'accountStatus', 'farmerName',
                              'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
                              'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
                              'detectedRiskName', 'updatedAt'
@@ -166,13 +188,13 @@ service cloud.firestore {
                          )
                        );
 
-      allow delete: if (isOwner(userId) || isAdmin()) && isValidId(userId);
+      allow delete: if (isOwner(userId) || isSuperAdmin()) && isValidId(userId);
 
       match /chat_logs/{logId} {
-        allow get: if (isOwner(userId) || isAdmin()) && isValidId(userId) && isValidId(logId);
-        allow list: if isOwner(userId) || isAdmin();
+        allow get: if (isOwner(userId) || isSuperAdmin()) && isValidId(userId) && isValidId(logId);
+        allow list: if isOwner(userId) || isSuperAdmin();
 
-        allow create: if (isOwner(userId) || isAdmin()) &&
+        allow create: if (isOwner(userId) || isSuperAdmin()) &&
                          isValidId(userId) &&
                          isValidId(logId) &&
                          incoming().keys().hasAll([
@@ -183,7 +205,7 @@ service cloud.firestore {
                          ]) &&
                          isValidCloudChatLog(incoming(), userId);
 
-        allow update: if (isOwner(userId) || isAdmin()) &&
+        allow update: if (isOwner(userId) || isSuperAdmin()) &&
                          isValidId(userId) &&
                          isValidId(logId) &&
                          isValidCloudChatLog(incoming(), userId) &&
@@ -193,7 +215,7 @@ service cloud.firestore {
                            'messageText', 'groundingSources', 'updatedAt'
                          ]);
 
-        allow delete: if (isOwner(userId) || isAdmin()) && isValidId(userId) && isValidId(logId);
+        allow delete: if (isOwner(userId) || isSuperAdmin()) && isValidId(userId) && isValidId(logId);
       }
     }
   }

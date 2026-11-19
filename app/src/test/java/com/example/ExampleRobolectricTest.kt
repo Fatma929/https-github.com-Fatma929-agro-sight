@@ -16,10 +16,12 @@ import com.example.data.GeminiGroundedResponse
 import com.example.data.MeteoForecastDataSource
 import com.example.data.OpenMeteoClient
 import com.example.data.OpenMeteoResult
+import com.example.data.OpenSourceSatelliteClient
 import com.example.data.RealSatelliteAndNasaTelemetry
 import com.example.data.SatelliteTelemetryDataSource
 import com.example.data.SqlFieldAuditDao
 import com.example.data.SqlFieldAuditEntity
+import com.example.data.StacAcquisitionStatus
 import com.example.model.AccountStatus
 import com.example.model.AppScreen
 import com.example.model.IrrigationDayStatus
@@ -31,6 +33,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -262,6 +265,88 @@ class ExampleRobolectricTest {
         assertTrue(parsed.isLiveConnected)
         assertEquals(3, parsed.records.size)
         assertEquals(5.4f, parsed.records[0].et0MmDay, 0.01f)
+    }
+
+    @Test
+    fun `parseStacFeatureCollectionJson distinguishes valid scene with band assets vs empty vs missing assets`() {
+        val satClient = OpenSourceSatelliteClient()
+
+        // 1. Valid scene with required spectral band assets (B02, B04, B05, B06, B08, B8A, B11, SCL)
+        val validStacJson = """
+            {
+              "type": "FeatureCollection",
+              "features": [
+                {
+                  "id": "S2B_35RQQ_20260501_0_L2A",
+                  "properties": {
+                    "datetime": "2026-05-01T08:42:11Z",
+                    "eo:cloud_cover": 2.4,
+                    "platform": "sentinel-2b",
+                    "mgrs:utm_zone": 35,
+                    "mgrs:latitude_band": "R",
+                    "mgrs:grid_square": "QQ"
+                  },
+                  "assets": {
+                    "blue": { "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B02.tif" },
+                    "red": { "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B04.tif" },
+                    "rededge1": { "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B05.tif" },
+                    "rededge2": { "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B06.tif" },
+                    "nir": { "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B08.tif" },
+                    "nir08": { "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B8A.tif" },
+                    "swir16": { "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B11.tif" },
+                    "scl": { "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/SCL.tif" }
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+        val validParsed = satClient.parseStacFeatureCollectionJson(
+            body = validStacJson,
+            httpCode = 200,
+            elapsedMs = 115L,
+            defaultMgrs = "35RQQ",
+            demoSceneId = "DEMO_SCENE"
+        )
+        assertEquals(StacAcquisitionStatus.VALID_SCENE_WITH_BAND_ASSETS, validParsed.status)
+        assertEquals("S2B_35RQQ_20260501_0_L2A", validParsed.sceneId)
+        assertTrue(validParsed.bandAssets.hasAllRequiredSpectralBands)
+        assertTrue(validParsed.bandAssets.b08Nir10mHref.isNotBlank())
+
+        // 2. Empty FeatureCollection (HTTP 200 but no matching scenes)
+        val emptyStacJson = """{"type": "FeatureCollection", "features": []}"""
+        val emptyParsed = satClient.parseStacFeatureCollectionJson(
+            body = emptyStacJson,
+            httpCode = 200,
+            elapsedMs = 90L,
+            defaultMgrs = "35RQQ",
+            demoSceneId = "DEMO_SCENE"
+        )
+        assertEquals(StacAcquisitionStatus.NO_MATCHING_SCENES, emptyParsed.status)
+
+        // 3. Scene present but missing spectral band assets
+        val missingAssetsJson = """
+            {
+              "type": "FeatureCollection",
+              "features": [
+                {
+                  "id": "S2A_INCOMPLETE_ASSETS",
+                  "properties": { "datetime": "2026-05-01T08:42:11Z", "eo:cloud_cover": 1.0 },
+                  "assets": {
+                    "visual": { "href": "https://example.com/TCI.tif" }
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+        val missingParsed = satClient.parseStacFeatureCollectionJson(
+            body = missingAssetsJson,
+            httpCode = 200,
+            elapsedMs = 88L,
+            defaultMgrs = "35RQQ",
+            demoSceneId = "DEMO_SCENE"
+        )
+        assertEquals(StacAcquisitionStatus.MISSING_OR_INACCESSIBLE_ASSETS, missingParsed.status)
+        assertFalse(missingParsed.bandAssets.hasAllRequiredSpectralBands)
     }
 
     @Test

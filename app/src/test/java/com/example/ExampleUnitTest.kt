@@ -7,26 +7,118 @@ import com.example.data.OpenMeteoClient
 import com.example.data.OpenSourceSatelliteClient
 import com.example.data.RecalculateAgronomicDerivedStateUseCase
 import com.example.data.SatelliteEpidemiologyEngine
+import com.example.data.Sentinel2BandMathEngine
+import com.example.data.Sentinel2PixelReflectance
+import com.example.data.TelemetryDataMode
 import com.example.data.redactPathForLog
 import com.example.data.redactUidForLog
 import com.example.model.AccountStatus
 import com.example.model.IrrigationDayStatus
 import com.example.model.IrrigationSystemType
 import com.example.model.SUPPORTED_CROPS
+import com.example.model.SoilDataProvenance
+import com.example.model.SoilLaboratorySample
 import com.example.model.SoilTexture
 import com.example.model.UserRole
 import com.example.model.WhatIfSimulatorInput
+import com.example.model.buildWeeklyIrrigationSchedule
+import com.example.model.computeWaterSavingsAnalytics
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Unit tests for AgroSight agricultural formulas, Egyptian National ID / mobile / Gmail validation,
- * PII log redaction, Open-Meteo JSON parsing, RBAC role guards, and derived-state calculations.
+ * Unit tests for AgroSight:
+ * - Sentinel-2 L2A spectral band mathematics (NDVI, NDRE, NDMI, PSRI, SCL cloud masking, NoData)
+ * - 3-tier Epidemiology distinction (Vegetation Stress vs Risk Assessment vs Confirmed Diagnosis)
+ * - FAO-56 Penman-Monteith & Water Savings Analytics (Potential vs Measured)
+ * - Egyptian National ID / mobile validation, PII redaction, and RBAC guards
  */
 class ExampleUnitTest {
+
+    @Test
+    fun `Sentinel2BandMathEngine computes accurate NDVI, NDRE, NDMI, and PSRI from spectral bands`() {
+        // Healthy vegetation reflectances:
+        // B02=0.04, B04=0.06, B05=0.12, B06=0.28, B08=0.42, B8A=0.40, B11=0.18, SCL=4
+        val sample = Sentinel2PixelReflectance(
+            row = 0,
+            col = 0,
+            b02Blue = 0.04f,
+            b04Red = 0.06f,
+            b05RedEdge1 = 0.12f,
+            b06RedEdge2 = 0.28f,
+            b08Nir = 0.42f,
+            b8aNarrowNir = 0.40f,
+            b11Swir1 = 0.18f,
+            sclClass = 4
+        )
+        val px = Sentinel2BandMathEngine.evaluatePixel(sample)
+        assertTrue(px.isValidUnmasked)
+        assertNull(px.maskReason)
+        // NDVI = (0.42 - 0.06) / (0.42 + 0.06) = 0.75
+        assertEquals(0.75f, px.ndvi!!, 0.001f)
+        // NDRE = (0.40 - 0.12) / (0.40 + 0.12) = 0.53846
+        assertEquals(0.28f / 0.52f, px.ndre!!, 0.001f)
+        // NDMI = (0.42 - 0.18) / (0.42 + 0.18) = 0.40
+        assertEquals(0.40f, px.ndmi!!, 0.001f)
+        // PSRI = (0.06 - 0.04) / 0.28 = 0.0714
+        assertEquals(0.02f / 0.28f, px.psri!!, 0.001f)
+    }
+
+    @Test
+    fun `Sentinel2BandMathEngine masks SCL cloud and shadow classes and handles zero denominators safely`() {
+        val maskedClasses = listOf(0, 1, 3, 8, 9, 10, 11)
+        for (scl in maskedClasses) {
+            assertTrue("SCL $scl should be masked", Sentinel2BandMathEngine.isCloudOrNoDataScl(scl))
+            val px = Sentinel2BandMathEngine.evaluatePixel(
+                Sentinel2PixelReflectance(
+                    row = 0,
+                    col = 0,
+                    b02Blue = 0.04f,
+                    b04Red = 0.06f,
+                    b05RedEdge1 = 0.12f,
+                    b06RedEdge2 = 0.28f,
+                    b08Nir = 0.42f,
+                    b8aNarrowNir = 0.40f,
+                    b11Swir1 = 0.18f,
+                    sclClass = scl
+                )
+            )
+            assertFalse(px.isValidUnmasked)
+            assertNotNull(px.maskReason)
+            assertNull(px.ndvi)
+        }
+
+        // Zero denominator protection
+        assertNull(Sentinel2BandMathEngine.computeNormalizedDifference(0f, 0f))
+        assertNull(Sentinel2BandMathEngine.computePsri(0.06f, 0.04f, 0f))
+        // NoData DN protection
+        assertTrue(Sentinel2BandMathEngine.convertDnToReflectance(0).isNaN())
+        assertEquals(0.50f, Sentinel2BandMathEngine.convertDnToReflectance(5000), 0.001f)
+    }
+
+    @Test
+    fun `Sentinel2BandMathEngine aggregates field statistics and produces valid GeoJSON anomaly polygon`() {
+        val healthy = Sentinel2PixelReflectance(0, 0, 0.04f, 0.06f, 0.12f, 0.28f, 0.42f, 0.40f, 0.18f, 4)
+        val stressed = Sentinel2PixelReflectance(0, 1, 0.05f, 0.16f, 0.18f, 0.21f, 0.24f, 0.22f, 0.25f, 5)
+        val cloudy = Sentinel2PixelReflectance(0, 2, 0.35f, 0.36f, 0.37f, 0.38f, 0.40f, 0.39f, 0.34f, 9)
+
+        val stats = Sentinel2BandMathEngine.aggregateRasterGrid(
+            samples = listOf(healthy, healthy, stressed, cloudy),
+            fieldLat = 30.3833,
+            fieldLon = 30.3500
+        )
+
+        assertEquals(4, stats.totalPixels)
+        assertEquals(3, stats.validPixels)
+        assertEquals(1, stats.cloudOrNoDataMaskedPixels)
+        assertEquals(0.75f, stats.validPixelRatio, 0.001f)
+        assertTrue(stats.geoJsonAnomalyPolygon.contains("\"FeatureCollection\""))
+        assertTrue(stats.geoJsonAnomalyPolygon.contains("\"Polygon\""))
+    }
 
     @Test
     fun `FAO56 scientific formula audit calculates valid ET0, Kc, Leaching Fraction, and Gross Water`() {
@@ -68,6 +160,48 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun `WaterSavingsAnalyticsSummary distinguishes potential modeled savings vs measured logged savings`() {
+        val forecast = OpenMeteoClient().buildFallbackForecast(30.3833, 30.3500, 1.15f).records
+        val schedule = buildWeeklyIrrigationSchedule(
+            forecastDays = forecast,
+            areaFeddans = 50f,
+            irrigationSystem = IrrigationSystemType.DRIP,
+            leachingRequirementPct = 14,
+            soilPh = 7.4f,
+            valveFlowRateM3PerFeddanHr = 16.0f,
+            statusOverrides = emptyMap()
+        )
+
+        val unloggedSummary = computeWaterSavingsAnalytics(
+            weeklySchedule = schedule,
+            areaFeddans = 50f,
+            loggedAppliedVolumesM3 = emptyList()
+        )
+        assertFalse(unloggedSummary.hasMeasuredExecutionLogs)
+        assertNull(unloggedSummary.measuredSavingsM3)
+        assertTrue(unloggedSummary.potentialModeledSavingsWeeklyM3 > 0f)
+
+        val loggedSummary = computeWaterSavingsAnalytics(
+            weeklySchedule = schedule,
+            areaFeddans = 50f,
+            loggedAppliedVolumesM3 = listOf(1200f, 1150f, 1180f)
+        )
+        assertTrue(loggedSummary.hasMeasuredExecutionLogs)
+        assertNotNull(loggedSummary.measuredSavingsM3)
+
+        val sample = SoilLaboratorySample(
+            sampleId = "LAB-2026-01",
+            sampleDateIso = "2026-05-01",
+            provenance = SoilDataProvenance.CERTIFIED_LAB_ANALYSIS,
+            ph = 7.5f,
+            eceDsM = 2.1f,
+            ecwDsM = 1.1f,
+            soilTexture = SoilTexture.LOAMY
+        )
+        assertEquals(SoilDataProvenance.CERTIFIED_LAB_ANALYSIS, sample.provenance)
+    }
+
+    @Test
     fun `Egyptian 14-digit National ID validation accepts valid IDs and rejects malformed ones`() {
         val validBeheira = DatabaseService.validateEgyptianNationalId("27805141801492")
         assertTrue(validBeheira.isValid)
@@ -102,16 +236,17 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun `OpenMeteoClient buildFallbackForecast builds 7-day agro forecast with offline baseline status`() {
+    fun `OpenMeteoClient buildFallbackForecast labels offline fallback explicitly as DEMO_ESTIMATED`() {
         val result = OpenMeteoClient().buildFallbackForecast(30.3833, 30.3500, 1.15f, isLive = false)
         assertFalse(result.isLiveConnected)
+        assertEquals(TelemetryDataMode.DEMO_ESTIMATED, result.dataMode)
         assertEquals(7, result.records.size)
         assertTrue(result.records.all { it.et0MmDay > 2.0f })
         assertTrue(result.statusMessageAr.contains("Offline Baseline"))
     }
 
     @Test
-    fun `SatelliteEpidemiologyEngine differentiates focal disease vs uniform valve fault vs soil pH lockup`() {
+    fun `SatelliteEpidemiologyEngine separates Vegetation Stress, Risk Assessment, and Confirmed Diagnosis`() {
         val focalReport = SatelliteEpidemiologyEngine.evaluateFieldEpidemiology(
             fieldId = "field_1",
             cropNameAr = "طماطم",
@@ -126,6 +261,14 @@ class ExampleUnitTest {
         assertTrue(focalReport.isBiologicalDisease)
         assertEquals(3, focalReport.affectedValveNumber)
         assertEquals(96, focalReport.pixelGrid.size)
+        // Verify 3-tier scientific separation
+        assertTrue(focalReport.vegetationStressDetectionAr.isNotBlank())
+        assertTrue(focalReport.agriculturalRiskAssessmentAr.isNotBlank())
+        assertTrue(focalReport.confirmedDiseaseDiagnosisStatusAr.contains("غير مؤكد"))
+        assertTrue(focalReport.supportingObservationsAr.isNotEmpty())
+        assertTrue(focalReport.possibleCausesAr.isNotEmpty())
+        assertTrue(focalReport.uncertaintyAndLimitationsAr.isNotEmpty())
+        assertTrue(focalReport.pixelGrid.all { it.ndvi in 0.1f..0.95f })
 
         val valveFaultReport = SatelliteEpidemiologyEngine.evaluateFieldEpidemiology(
             fieldId = "field_1",
