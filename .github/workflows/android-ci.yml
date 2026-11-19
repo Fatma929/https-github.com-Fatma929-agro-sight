@@ -37,8 +37,12 @@ jobs:
             cp .env.example .env
           fi
 
-      - name: Run Python Sentinel-2 Raster Backend Unit Tests
-        run: python3 -m unittest discover -s backend -p "test_*.py"
+      - name: Install Python Geospatial & FastAPI Backend Dependencies
+        if: hashFiles('backend/requirements.txt') != ''
+        run: python3 -m pip install --upgrade pip && python3 -m pip install -r backend/requirements.txt
+
+      - name: Run Python Sentinel-2 Raster & FastAPI Backend Unit Tests
+        run: python3 -m unittest discover -s backend -p "test_*.py" -v
 
       - name: Run Android Unit & Robolectric Tests
         run: gradle :app:testDebugUnitTest

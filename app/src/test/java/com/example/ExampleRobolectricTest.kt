@@ -161,7 +161,9 @@ class ExampleRobolectricTest {
         }
     }
 
-    private class FakeCloudWorkspaceRepository : CloudWorkspaceRepository {
+    private class FakeCloudWorkspaceRepository(
+        private val authenticatedUid: String? = null
+    ) : CloudWorkspaceRepository {
         override val currentUser: FirebaseUser? = null
 
         override fun observeAuthState(): Flow<FirebaseUser?> = flowOf(null)
@@ -210,6 +212,19 @@ class ExampleRobolectricTest {
             messageText: String,
             groundingSources: String
         ): Result<Unit> = Result.success(Unit)
+
+        override suspend fun deleteCloudWorkspace(userId: String): Result<Unit> {
+            if (userId.isBlank()) {
+                return Result.failure(IllegalArgumentException("Blank userId"))
+            }
+            val uid = authenticatedUid ?: return Result.failure(IllegalStateException("Not signed in"))
+            if (uid != userId) {
+                return Result.failure(
+                    SecurityException("Unauthorized workspace deletion: authenticated UID does not match requested userId")
+                )
+            }
+            return Result.success(Unit)
+        }
     }
 
     private class FakeSqlFieldAuditDao : SqlFieldAuditDao {
@@ -221,7 +236,8 @@ class ExampleRobolectricTest {
 
     private fun buildTestViewModel(
         app: Application,
-        throwCancellation: Boolean = false
+        throwCancellation: Boolean = false,
+        authenticatedUid: String? = null
     ): AgroSightViewModel {
         app.getSharedPreferences("agrosight_multi_tenant_db", Context.MODE_PRIVATE)
             .edit()
@@ -234,9 +250,13 @@ class ExampleRobolectricTest {
             databaseService = dbService,
             openMeteoClient = FakeMeteoDataSource(),
             openSourceSatelliteClient = FakeSatelliteDataSource(),
+            satelliteRasterBackendRepository = com.example.data.RetrofitSatelliteRasterBackendRepository(
+                baseUrl = "http://127.0.0.1:1/",
+                stacClient = OpenSourceSatelliteClient()
+            ),
             geminiAgroService = fakeGemini,
             cloudWorker = AgroSightCloudWorker(dbService, fakeGemini),
-            firestoreRepository = FakeCloudWorkspaceRepository(),
+            firestoreRepository = FakeCloudWorkspaceRepository(authenticatedUid = authenticatedUid),
             sqlAuditDao = FakeSqlFieldAuditDao()
         )
         return AgroSightViewModel(app, deps)
@@ -414,4 +434,120 @@ class ExampleRobolectricTest {
             viewModel.uiState.value.isGeneratingGeminiDiagnosis
         )
     }
+
+    private class FakeSatelliteRasterBackendRepository : com.example.data.SatelliteRasterBackendRepository {
+        override suspend fun checkBackendHealth(): Result<Boolean> = Result.success(true)
+
+        override suspend fun runFullGeoreferencedSatelliteAnalysis(
+            farmId: String,
+            ownerUid: String,
+            cropId: String,
+            growthStageIndex: Int,
+            centerLat: Double,
+            centerLon: Double,
+            areaFeddans: Float,
+            customPolygonGeoJson: String?,
+            explicitAuthToken: String?
+        ): Result<com.example.data.GeoreferencedRasterBackendResult> {
+            val cells = (0 until 96).map { idx ->
+                val r = idx / 12
+                val c = idx % 12
+                com.example.data.SpectralPixelCell(
+                    row = r,
+                    col = c,
+                    valveNumber = (((r / 4) * 3) + (c / 4) + 1).coerceIn(1, 6),
+                    ndvi = 0.72f,
+                    ndre = 0.39f,
+                    psri = 0.08f,
+                    ndmi = 0.36f,
+                    isHotspot = (r == 2 && c == 8),
+                    isCloudMasked = false
+                )
+            }
+            return Result.success(
+                com.example.data.GeoreferencedRasterBackendResult(
+                    resultId = "res_test_001",
+                    jobId = "job_test_001",
+                    farmId = farmId,
+                    ownerUid = ownerUid,
+                    sceneId = "S2B_35RQQ_20260501_0_L2A",
+                    cropId = cropId,
+                    executionState = com.example.data.RasterPipelineExecutionState.COMPLETED_LIVE_GEOREFERENCED,
+                    isLiveGeoreferencedRaster = true,
+                    crsEpsg = 32636,
+                    spatialResolutionMeters = 10.0f,
+                    totalPixels = 96,
+                    polygonPixels = 96,
+                    validPixels = 94,
+                    maskedCloudPixels = 2,
+                    validPixelRatio = 94f / 96f,
+                    ndviMean = 0.72f,
+                    ndviStdDev = 0.04f,
+                    ndreMean = 0.39f,
+                    ndmiMean = 0.36f,
+                    psriMean = 0.08f,
+                    anomalyPixelCount = 3,
+                    anomalyAreaFeddans = 0.07f,
+                    anomalyZonesGeoJson = """{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[30.34,30.38],[30.35,30.38],[30.35,30.39],[30.34,30.39],[30.34,30.38]]]},"properties":{"cluster_id":1}}]}""",
+                    pixelGrid = cells,
+                    vegetationStressDetectionAr = "رصد شذوذ طيفي موضعي في 3 بكسلات مرجعية داخل حدود المزرعة",
+                    agriculturalRiskAssessmentAr = "احتمال إجهاد فسيولوجي مبكر يتطلب فحص المحبس رقم 3",
+                    confirmedDiseaseDiagnosisStatusAr = "غير مؤكد مختبرياً — الشذوذ الطيفي من القمر الصناعي لا يغني عن المعاينة الحقلية",
+                    statusSummaryAr = "تم تحليل 94 بكسل مرجعي (EPSG:32636 • دقة 10.0م)"
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `AgroSightViewModel runGeoreferencedRasterAnalysis and RetrofitSatelliteRasterBackendRepository update 3-tier scientific state`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val dbService = DatabaseService(app)
+        val fakeGemini = FakeAiCopilotDataSource()
+        val viewModel = AgroSightViewModel(
+            app,
+            AgroSightDependencies(
+                databaseService = dbService,
+                openMeteoClient = FakeMeteoDataSource(),
+                openSourceSatelliteClient = FakeSatelliteDataSource(),
+                satelliteRasterBackendRepository = FakeSatelliteRasterBackendRepository(),
+                geminiAgroService = fakeGemini,
+                cloudWorker = AgroSightCloudWorker(dbService, fakeGemini),
+                firestoreRepository = FakeCloudWorkspaceRepository(authenticatedUid = "farmer_admin_owner"),
+                sqlAuditDao = FakeSqlFieldAuditDao()
+            )
+        )
+
+        viewModel.runGeoreferencedRasterAnalysis()
+        val rasterRes = viewModel.uiState.value.rasterBackendResult
+        assertNotNull("Georeferenced raster backend result must be populated", rasterRes)
+        assertTrue(rasterRes!!.isLiveGeoreferencedRaster)
+        assertEquals(32636, rasterRes.crsEpsg)
+        assertEquals(10.0f, rasterRes.spatialResolutionMeters, 0.01f)
+        assertEquals(96, rasterRes.pixelGrid.size)
+        assertTrue(rasterRes.anomalyZonesGeoJson.contains("\"FeatureCollection\""))
+        assertTrue(viewModel.uiState.value.epidemiologyReport.dataModeDesignation.contains("LIVE_GEOREFERENCED_RASTER"))
+        assertTrue(viewModel.uiState.value.epidemiologyReport.confirmedDiseaseDiagnosisStatusAr.contains("غير مؤكد"))
+    }
+
+    @Test
+    fun `deleteCloudWorkspace enforces UID ownership verification and blocks cross-user deletion`() {
+        val repo = FakeCloudWorkspaceRepository(authenticatedUid = "farmer_alice_123")
+
+        // 1. Blank userId is rejected
+        val blankRes = kotlinx.coroutines.runBlocking { repo.deleteCloudWorkspace("") }
+        assertTrue(blankRes.isFailure)
+        assertTrue(blankRes.exceptionOrNull() is IllegalArgumentException)
+
+        // 2. Unauthorized cross-user deletion (Alice trying to delete Bob's workspace) is rejected with SecurityException
+        val crossUserRes = kotlinx.coroutines.runBlocking { repo.deleteCloudWorkspace("farmer_bob_456") }
+        assertTrue(crossUserRes.isFailure)
+        assertTrue(crossUserRes.exceptionOrNull() is SecurityException)
+
+        // 3. Owner deleting their own workspace succeeds
+        val ownerRes = kotlinx.coroutines.runBlocking { repo.deleteCloudWorkspace("farmer_alice_123") }
+        assertTrue(ownerRes.isSuccess)
+    }
 }
+
+

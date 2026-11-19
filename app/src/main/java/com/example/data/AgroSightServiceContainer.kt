@@ -31,7 +31,8 @@ data class AgroSightDependencies(
     val geminiAgroService: AgroAiCopilotDataSource,
     val cloudWorker: AgroSightCloudWorker,
     val firestoreRepository: CloudWorkspaceRepository,
-    val sqlAuditDao: SqlFieldAuditDao
+    val sqlAuditDao: SqlFieldAuditDao,
+    val satelliteRasterBackendRepository: SatelliteRasterBackendRepository = RetrofitSatelliteRasterBackendRepository()
 ) {
     companion object {
         fun createDefault(context: Context): AgroSightDependencies {
@@ -46,6 +47,7 @@ data class AgroSightDependencies(
             )
             val firestoreRepo = AgroSightFirestoreRepository(appContext)
             val roomDao = AgroSightRoomDatabase.getInstance(appContext).sqlFieldAuditDao()
+            val rasterBackendRepo = RetrofitSatelliteRasterBackendRepository()
             return AgroSightDependencies(
                 databaseService = dbService,
                 openMeteoClient = meteo,
@@ -53,7 +55,8 @@ data class AgroSightDependencies(
                 geminiAgroService = gemini,
                 cloudWorker = worker,
                 firestoreRepository = firestoreRepo,
-                sqlAuditDao = roomDao
+                sqlAuditDao = roomDao,
+                satelliteRasterBackendRepository = rasterBackendRepo
             )
         }
     }

@@ -20,21 +20,27 @@
 
 ### أ. فصل بيانات الهوية الحساسة ومنع توليد بيانات وهمية (Data Minimization & Zero Fabrication)
 - يلتزم `AgroSightFirestoreRepository.kt` بعدم رفع الرقم القومي (`nationalId`) أو رقم الهاتف (`whatsappPhone`) أو البريد الإلكتروني (`gmailAddress`) إلى وثائق `/users/{userId}` في Firestore.
-- لا يقوم التطبيق أبداً بتوليد أرقام قومية وهمية مكوّنة من أصفار (`00000000000000`) أو إدراج أرقام هواتف أو عناوين بريد افتراضية عند غيابها.
+- يلتزم `DatabaseService.kt` بعدم توليد أي بيانات شخصية وهمية عند التسجيل بمعرّف واحد (مثل تسجيل الدخول برقم الموبايل فقط أو البريد فقط): تظل الحقول غير المدخلة فارغة تماماً (`""`)، ولا يتم أبداً توليد أرقام قومية افتراضية أو أرقام هواتف أو عناوين بريد مصطنعة.
+- يتم عزل الحسابات الاسترشادية (`farmer_1`, `farmer_2`, `farmer_3`) صراحةً عبر العلم `isDemoAccount = true` مع ترك حقل `nationalId = ""` فارغاً بالكامل.
 - تتحقق قواعد `firestore.rules` عبر `incoming().keys().hasOnly([...])` من رفض أي وثيقة تحتوي على `nationalId` أو حقول شخصية غير مصرح بها.
 
 ### ب. صلاحيات مبنية على مبدأ أقل امتياز (Least-Privilege RBAC)
 - **`FARMER`**: يقرأ ويعدل مساحة عمله الزراعية فقط (`/users/{userId}`) وسجلات محادثاته (`/users/{userId}/chat_logs/{logId}`)، ولا يمكنه قراءة بيانات أي مزارع آخر أو ترقية صلاحيته.
-- **`AGRONOMIST_ADMIN`**: يمكنه قراءة البيانات الزراعية والطيفيه للحقول وتحديث المؤشرات الإرشادية (`soilPh`, `soilEce`, `waterEcw`, `ndviMean`, `ndreMean`, `psriMean`, `ndmiMean`, `detectedRiskName`)، ولكن **تمنعه قواعد `firestore.rules`** من تغيير أدوار المستخدمين (`role`)، أو حالة الحساب (`accountStatus`)، أو حذف حسابات المزارعين، أو الاطلاع على سجلات المحادثات الخاصة (`chat_logs`)، أو تعديل سجل المشرفين (`/admins`).
+- **`AGRONOMIST_ADMIN`**: يمكنه قراءة البيانات الزراعية والطيفية للحقول وتحديث المؤشرات الإرشادية (`soilPh`, `soilEce`, `waterEcw`, `ndviMean`, `ndreMean`, `psriMean`, `ndmiMean`, `detectedRiskName`)، ولكن **تمنعه قواعد `firestore.rules`** من تغيير أدوار المستخدمين (`role`)، أو حالة الحساب (`accountStatus`)، أو حذف حسابات المزارعين، أو الاطلاع على سجلات المحادثات الخاصة (`chat_logs`)، أو تعديل سجل المشرفين (`/admins`).
 - **`SUPER_ADMIN`**: يقتصر على المالك الموثق (`email_verified == true`) أو المشرفين المعينين في `/admins/{uid}` بصلاحية `SUPER_ADMIN` لإدارة الأدوار وحالات الحسابات.
 
-### ج. تنقيح السجلات ومنع النسخ الاحتياطي غير المشفر (PII Log Redaction & Backup Hardening)
+### ج. تنقيح السجلات وعزل ملفات الراستر ومنع النسخ الاحتياطي غير المشفر
 - تستخدم `handleFirestoreError` دوال `redactUidForLog` و `redactPathForLog` لمنع طباعة أي بيانات شخصية أو معرفات كاملة في `Logcat`.
+- يعزل خادم معالجة صور الأقمار الصناعية (`backend/app.py`) ملفات `GeoTIFF` الناتجة لكل مستخدم داخل مسار فرعي معزول مبني على بصمة `SHA-256` لمعرف المستخدم (`uid`)، ويفرض التحقق من ملكية المزرعة (`403 FORBIDDEN_FARM_ACCESS`) قبل تشغيل أو قراءة أي مهمة معالجة.
 - تم ضبط `android:allowBackup="false"` في `AndroidManifest.xml` واستبعاد ملفات قواعد البيانات المحلية في `backup_rules.xml` و `data_extraction_rules.xml`.
 
 ---
 
 ## 3. الاحتفاظ بالبيانات وحذف الحساب (Data Retention & Deletion Workflows)
 
-- **حذف البيانات السحابية (`deleteCloudWorkspace`)**: يوفر `AgroSightFirestoreRepository.deleteCloudWorkspace(userId)` إمكانية حذف سجلات `chat_logs` ووثيقة `/users/{userId}` بالكامل من سحابة Firestore للمستخدم المالك (`allow delete: if isOwner(userId) || isSuperAdmin()`).
+- **حذف البيانات السحابية (`deleteCloudWorkspace`)**:
+  1. يتحقق `AgroSightFirestoreRepository.deleteCloudWorkspace(userId)` أولاً من تطابق معرف المستخدم المصادق عليه حالياً مع المعرف المطلوب حذفه (`uid == userId`)، ويرفض أي طلب غير مطابق عبر `SecurityException`.
+  2. يقوم بحذف جميع وثائق المجموعة الفرعية `/users/{userId}/chat_logs` على دفعات متتالية (`WriteBatch` بحجم 100 وثيقة لكل دفعة في حلقة تكرارية) لضمان عدم بقاء أي وثائق يتيمة (Orphaned Subcollections) حتى لو تجاوز عدد الرسائل 50 وثيقة.
+  3. بعد إفراغ المجموعة الفرعية بالكامل، يحذف الوثيقة الأم `/users/{userId}`.
 - **حذف البيانات المحلية**: يمكن للمستخدم حذف سجلات التدقيق المحلية في Room SQLite (`deleteRoomSqlAudit`)، ويمكن لمدير النظام حذف الحسابات المحلية من بوابة الإدارة (`adminDeleteUserAccount`).
+

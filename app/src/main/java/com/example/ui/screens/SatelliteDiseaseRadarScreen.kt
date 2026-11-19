@@ -165,11 +165,92 @@ fun SatelliteDiseaseRadarScreen(
 
         // Data Provenance & Agronomic Safety Disclaimer Banner
         item {
+            val isLiveGeorefRaster = uiState.rasterBackendResult?.isLiveGeoreferencedRaster == true
             AgronomicSafetyAndDataProvenanceBanner(
                 isLiveMeteoConnected = uiState.isLiveMeteoConnected,
                 meteoStatusAr = uiState.meteoStatusAr,
-                isSimulatedSpectralPattern = true
+                isSimulatedSpectralPattern = !isLiveGeorefRaster
             )
+        }
+
+        // Georeferenced Raster Engine Telemetry & 3-Tier Scientific Assessment Card
+        item {
+            val rasterRes = uiState.rasterBackendResult
+            BentoCard(
+                title = "محرك المعالجة الطيفية الجغرافية (Sentinel-2 L2A GeoTIFF Raster Engine)",
+                subtitle = "حالة مصدر البيانات: ${report.dataModeDesignation}",
+                icon = Icons.Default.SatelliteAlt,
+                accentColor = if (rasterRes?.isLiveGeoreferencedRaster == true) EmeraldPrimary else AmberWarning
+            ) {
+                if (rasterRes != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SpectralIndexMiniCard(
+                            modifier = Modifier.weight(1f),
+                            code = "CRS",
+                            labelAr = "نظام الإحداثيات",
+                            value = "EPSG:${rasterRes.crsEpsg}",
+                            color = EmeraldDark
+                        )
+                        SpectralIndexMiniCard(
+                            modifier = Modifier.weight(1f),
+                            code = "RES",
+                            labelAr = "الدقة المكانية",
+                            value = "${rasterRes.spatialResolutionMeters.toInt()}m",
+                            color = SkyAccent
+                        )
+                        SpectralIndexMiniCard(
+                            modifier = Modifier.weight(1f),
+                            code = "VALID",
+                            labelAr = "البكسلات الصافية",
+                            value = "${(rasterRes.validPixelRatio * 100f).toInt()}%",
+                            color = EmeraldPrimary
+                        )
+                        SpectralIndexMiniCard(
+                            modifier = Modifier.weight(1f),
+                            code = "ANOMALY",
+                            labelAr = "مضلعات GeoJSON",
+                            value = "${rasterRes.anomalyPixelCount}px",
+                            color = if (rasterRes.anomalyPixelCount > 0) RoseDanger else EmeraldPrimary
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
+
+                Surface(
+                    color = Slate100,
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Slate200),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("scientific_three_tier_separation_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "1. رصد الإجهاد الطيفي: ${report.vegetationStressDetectionAr}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate900,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "2. تقييم المخاطر الزراعية: ${report.agriculturalRiskAssessmentAr}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate700
+                        )
+                        Text(
+                            text = "3. حالة التشخيص المؤكد: ${report.confirmedDiseaseDiagnosisStatusAr}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AmberWarning,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
         }
 
         // Recharts 7-Day Proposed Irrigation Schedule vs. Daily Crop Water Requirement Chart

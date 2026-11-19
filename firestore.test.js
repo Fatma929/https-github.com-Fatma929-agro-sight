@@ -244,6 +244,18 @@ test("Cross-farmer isolation: Bob cannot read or modify Alice's workspace or pri
   await assertFails(bobDb.collection("users").doc(ALICE_UID).collection("chat_logs").get());
   await assertFails(bobDb.collection("users").doc(ALICE_UID).collection("chat_logs").doc("log_1").get());
 
-  // Even an AGRONOMIST_ADMIN cannot read private farmer chat_logs (only owner or SUPER_ADMIN)
+  // Cross-user Bob cannot delete Alice's chat logs or workspace
+  await assertFails(bobDb.collection("users").doc(ALICE_UID).collection("chat_logs").doc("log_1").delete());
+  await assertFails(bobDb.collection("users").doc(ALICE_UID).delete());
+
+  // Even an AGRONOMIST_ADMIN cannot read or delete private farmer chat_logs (only owner or SUPER_ADMIN)
   await assertFails(agronomistDb.collection("users").doc(ALICE_UID).collection("chat_logs").get());
+  await assertFails(agronomistDb.collection("users").doc(ALICE_UID).collection("chat_logs").doc("log_1").delete());
+
+  // Owner Alice can batch-delete her chat_logs subcollection and parent workspace without leaving orphaned docs
+  const batch = aliceDb.batch();
+  batch.delete(aliceDb.collection("users").doc(ALICE_UID).collection("chat_logs").doc("log_1"));
+  batch.delete(aliceDb.collection("users").doc(ALICE_UID));
+  await assertSucceeds(batch.commit());
 });
+

@@ -369,4 +369,132 @@ class ExampleUnitTest {
         assertEquals(6, computed.valveSectors.size)
         assertTrue(computed.whatIfResult.simulatedNutrientIndexPct > computed.whatIfResult.baselineNutrientIndexPct)
     }
+
+    @Test
+    fun `KotlinGeoTiffCogProcessor writes and parses georeferenced float32 GeoTIFF with CRS and 10m resolution`() {
+        val grid = arrayOf(
+            floatArrayOf(0.74f, 0.72f, 0.69f, -9999f),
+            floatArrayOf(0.71f, 0.25f, 0.23f, 0.68f),
+            floatArrayOf(0.70f, 0.24f, 0.22f, 0.67f)
+        )
+        val tiffBytes = com.example.data.KotlinGeoTiffCogProcessor.writeGeoTiffBytes(
+            width = 4,
+            height = 3,
+            crsEpsg = 32636,
+            originX = 245000.0,
+            originY = 3365000.0,
+            pixelWidth = 10.0,
+            pixelHeight = 10.0,
+            grid = grid,
+            isFloat32 = true
+        )
+        assertTrue("GeoTIFF binary header must start with little-endian II (0x49 0x49 0x2A 0x00)", tiffBytes.size > 64)
+        assertEquals('I'.code.toByte(), tiffBytes[0])
+        assertEquals('I'.code.toByte(), tiffBytes[1])
+        assertEquals(42.toByte(), tiffBytes[2])
+
+        val parsed = com.example.data.KotlinGeoTiffCogProcessor.readGeoTiffBytes(tiffBytes, "NDVI")
+        assertNotNull(parsed)
+        assertEquals(4, parsed.width)
+        assertEquals(3, parsed.height)
+        assertEquals(32636, parsed.crsEpsg)
+        assertEquals(10.0, parsed.pixelWidth, 0.001)
+        assertEquals(-10.0, parsed.pixelHeight, 0.001)
+        assertEquals(245000.0, parsed.originX, 0.01)
+        assertEquals(3365000.0, parsed.originY, 0.01)
+        assertEquals(0.74f, parsed.grid[0][0], 0.001f)
+        assertEquals(0.25f, parsed.grid[1][1], 0.001f)
+        assertEquals(-9999f, parsed.grid[0][3], 0.001f)
+    }
+
+    @Test
+    fun `Sentinel2BandMathEngine supports BOA offset, 20m-to-10m alignment, crop thresholds, and connected-component GeoJSON`() {
+        // 1. Processing Baseline 04.00+ BOA offset (-1000 DN)
+        val reflLegacy = Sentinel2BandMathEngine.convertDnToReflectance(3500, scaleFactor = 0.0001f, offset = 0.0f)
+        val reflPb04 = Sentinel2BandMathEngine.convertDnToReflectance(3500, scaleFactor = 0.0001f, offset = -1000.0f)
+        assertEquals(0.35f, reflLegacy, 0.0001f)
+        assertEquals(0.25f, reflPb04, 0.0001f)
+
+        // 2. 20m to 10m multi-resolution band alignment
+        val scl20m = arrayOf(
+            floatArrayOf(4f, 9f),
+            floatArrayOf(4f, 4f)
+        )
+        val scl10m = Sentinel2BandMathEngine.align20mGridTo10m(scl20m, targetRows = 4, targetCols = 4, isCategorical = true)
+        assertEquals(4f, scl10m[0][0], 0.001f)
+        assertEquals(9f, scl10m[0][3], 0.001f)
+        assertEquals(9f, scl10m[1][2], 0.001f)
+        assertEquals(4f, scl10m[3][3], 0.001f)
+
+        // 3. Crop-specific anomaly thresholds differ by crop type and growth stage
+        val potatoThresh = Sentinel2BandMathEngine.getCropThresholds("potato", growthStageIndex = 2)
+        val palmThresh = Sentinel2BandMathEngine.getCropThresholds("date_palm", growthStageIndex = 2)
+        assertTrue(
+            "Potato mid-season NDRE threshold must exceed arid Date Palm threshold",
+            potatoThresh.stressedNdreThreshold > palmThresh.stressedNdreThreshold
+        )
+        assertTrue(
+            "Potato water stress NDMI threshold must exceed Date Palm threshold",
+            potatoThresh.waterStressNdmiThreshold > palmThresh.waterStressNdmiThreshold
+        )
+
+        // 4. Connected-component GeoJSON vectorization: 0 anomalies -> empty features[], never a fixed center square
+        val healthySamples = listOf(
+            Sentinel2PixelReflectance(0, 0, 0.04f, 0.05f, 0.11f, 0.30f, 0.46f, 0.44f, 0.17f, 4),
+            Sentinel2PixelReflectance(0, 1, 0.04f, 0.05f, 0.11f, 0.30f, 0.45f, 0.43f, 0.17f, 4)
+        )
+        val healthyStats = Sentinel2BandMathEngine.aggregateRasterGrid(
+            samples = healthySamples,
+            fieldLat = 30.3833,
+            fieldLon = 30.3500,
+            cropId = "potato"
+        )
+        assertTrue(
+            "Healthy field must emit empty features array, not a fixed center square",
+            healthyStats.geoJsonAnomalyPolygon.contains("\"features\": []") ||
+                healthyStats.geoJsonAnomalyPolygon.contains("\"features\":[]")
+        )
+    }
+
+    @Test
+    fun `DatabaseService never fabricates National IDs, phone numbers, or emails when registering or bootstrapping`() {
+        val db = DatabaseService(context = null)
+        val snap = db.getSnapshot()
+
+        // 1. Bootstrapped Super Admin has no fabricated phone or National ID
+        val admin = snap.farmers.first { it.id == "farmer_admin_owner" }
+        assertEquals("", admin.whatsappPhone)
+        assertEquals("", admin.nationalId)
+        assertFalse(admin.isDemoAccount)
+
+        // 2. Pre-seeded demo farms are explicitly isolated with isDemoAccount = true and blank nationalId
+        val demoFarmers = snap.farmers.filter { it.id in setOf("farmer_1", "farmer_2", "farmer_3") }
+        assertEquals(3, demoFarmers.size)
+        assertTrue(demoFarmers.all { it.isDemoAccount })
+        assertTrue(demoFarmers.all { it.nationalId.isEmpty() })
+
+        // 3. Logging in with ONLY a mobile number must NOT fabricate a fake Gmail or fake 14-digit National ID
+        val (okPhone, _, snapAfterPhone) = db.authenticateBySingleIdentifier(
+            AuthLoginChannel.MOBILE_NUMBER,
+            "01055667788"
+        )
+        assertTrue(okPhone)
+        val phoneUser = snapAfterPhone.farmers.first { it.id == snapAfterPhone.activeFarmerId }
+        assertEquals("+201055667788", phoneUser.whatsappPhone)
+        assertEquals("Missing email must remain empty, never fabricated", "", phoneUser.gmailAddress)
+        assertEquals("Missing nationalId must remain empty, never fabricated", "", phoneUser.nationalId)
+        assertFalse(phoneUser.isDemoAccount)
+
+        // 4. Logging in with ONLY a Gmail address must NOT fabricate a fake phone or fake National ID
+        val (okGmail, _, snapAfterGmail) = db.authenticateBySingleIdentifier(
+            AuthLoginChannel.GMAIL_ACCOUNT,
+            "real.agronomist@gmail.com"
+        )
+        assertTrue(okGmail)
+        val gmailUser = snapAfterGmail.farmers.first { it.id == snapAfterGmail.activeFarmerId }
+        assertEquals("real.agronomist@gmail.com", gmailUser.gmailAddress)
+        assertEquals("", gmailUser.whatsappPhone)
+        assertEquals("", gmailUser.nationalId)
+    }
 }
+

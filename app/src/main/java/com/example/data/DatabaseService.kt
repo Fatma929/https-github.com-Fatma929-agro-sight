@@ -88,18 +88,19 @@ enum class WhatsAppAlertCategory(val code: String, val badgeAr: String) {
     SOIL_PH_ALERT("SOIL_PH_ALERT", "معالجة قلوية التربة والأحماض")
 }
 
-// 1. Table: farmers (Users with RBAC role & account status)
+// 1. Table: farmers (Users with RBAC role, account status, and explicit demo isolation)
 data class FarmerEntity(
     val id: String,
     val fullName: String,
-    val whatsappPhone: String, // +201xxxxxxxxx (Mobile Number)
-    val gmailAddress: String = "mahmoud.amalfarm@gmail.com", // Gmail account
-    val nationalId: String = "27805141801492", // 14-digit Egyptian National ID (الرقم القومي المصري)
+    val whatsappPhone: String, // +201xxxxxxxxx (Mobile Number, or blank if not provided)
+    val gmailAddress: String = "", // Gmail account (blank if not provided)
+    val nationalId: String = "", // 14-digit Egyptian National ID (never fabricated; blank unless explicitly provided)
     val region: String,
     val preferredAlertTime: String,
     val role: UserRole = UserRole.FARMER,
     val accountStatus: AccountStatus = AccountStatus.ACTIVE,
-    val lastLoginAt: String = "08:00 ص"
+    val lastLoginAt: String = "08:00 ص",
+    val isDemoAccount: Boolean = false
 )
 
 enum class AuthLoginChannel(val labelAr: String, val hintAr: String) {
@@ -223,14 +224,15 @@ class DatabaseService(context: Context? = null) {
             val adminFarmer = FarmerEntity(
                 id = "farmer_admin_owner",
                 fullName = "م. فاطمة الزهراء (Super Admin)",
-                whatsappPhone = "+201000112233",
+                whatsappPhone = "",
                 gmailAddress = adminEmail,
-                nationalId = "29504120101488",
+                nationalId = "",
                 region = "وادي النطرون",
                 preferredAlertTime = "06:00 ص",
                 role = UserRole.SUPER_ADMIN,
                 accountStatus = AccountStatus.ACTIVE,
-                lastLoginAt = currentTimeFormatted()
+                lastLoginAt = currentTimeFormatted(),
+                isDemoAccount = false
             )
             farmers.add(0, adminFarmer)
             if (fields.none { it.farmerId == adminFarmer.id }) {
@@ -526,7 +528,7 @@ class DatabaseService(context: Context? = null) {
             return Triple(true, msg, getSnapshot())
         }
 
-        // Validate input format before auto-registering a fast account if not found
+        // Validate input format before auto-registering a profile if not found (never fabricate missing PII)
         return when (channel) {
             AuthLoginChannel.MOBILE_NUMBER -> {
                 val digits = trimmed.filter { it.isDigit() }
@@ -537,8 +539,8 @@ class DatabaseService(context: Context? = null) {
                     val snap = loginOrRegisterByWhatsApp(
                         fullName = "المزارع (${normPhone.takeLast(4)})",
                         whatsappPhoneInput = normPhone,
-                        gmailInput = "farmer.${normPhone.takeLast(4)}@gmail.com",
-                        nationalIdInput = "2850101180${normPhone.takeLast(4)}",
+                        gmailInput = "",
+                        nationalIdInput = "",
                         regionName = "وادي النطرون",
                         cropNameAr = "طماطم",
                         areaFeddans = 50f
@@ -555,9 +557,9 @@ class DatabaseService(context: Context? = null) {
                     val localPart = cleanGmail.substringBefore("@").replace(".", " ")
                     val snap = loginOrRegisterByWhatsApp(
                         fullName = "مزارع ($localPart)",
-                        whatsappPhoneInput = "+201098765432",
+                        whatsappPhoneInput = "",
                         gmailInput = cleanGmail,
-                        nationalIdInput = "28406151301984",
+                        nationalIdInput = "",
                         regionName = "الصالحية الجديدة",
                         cropNameAr = "بطاطس",
                         areaFeddans = 60f
@@ -574,8 +576,8 @@ class DatabaseService(context: Context? = null) {
                     val last4 = natValidation.normalized14Digits.takeLast(4)
                     val snap = loginOrRegisterByWhatsApp(
                         fullName = "مزارع موثق (${natValidation.governorateAr} #$last4)",
-                        whatsappPhoneInput = "+20106543$last4",
-                        gmailInput = "agro.id$last4@gmail.com",
+                        whatsappPhoneInput = "",
+                        gmailInput = "",
                         nationalIdInput = natValidation.normalized14Digits,
                         regionName = "وادي النطرون",
                         cropNameAr = "قمح",
@@ -597,28 +599,24 @@ class DatabaseService(context: Context? = null) {
         areaFeddans: Float,
         requestedRole: UserRole? = null
     ): RelationalDatabaseSnapshot {
-        val normalizedPhone = normalizeEgyptianWhatsApp(whatsappPhoneInput)
-        val normalizedGmail = normalizeGmailAddress(
-            gmailInput.ifBlank { "farmer.${normalizedPhone.takeLast(4)}@gmail.com" }
-        )
-        val normalizedNationalId = normalizeEgyptianNationalId(
-            nationalIdInput,
-            fallbackSuffix = normalizedPhone.takeLast(4)
-        )
+        val normalizedPhone = if (whatsappPhoneInput.isBlank()) "" else normalizeEgyptianWhatsApp(whatsappPhoneInput)
+        val normalizedGmail = if (gmailInput.isBlank()) "" else normalizeGmailAddress(gmailInput)
+        val normalizedNationalId = if (nationalIdInput.isBlank()) "" else normalizeEgyptianNationalId(nationalIdInput)
 
         val existingIdx = farmers.indexOfFirst {
-            it.whatsappPhone == normalizedPhone ||
-                (gmailInput.isNotBlank() && it.gmailAddress.equals(normalizedGmail, ignoreCase = true)) ||
-                (nationalIdInput.filter { c -> c.isDigit() }.length == 14 && it.nationalId == normalizedNationalId)
+            (normalizedPhone.isNotBlank() && it.whatsappPhone == normalizedPhone) ||
+                (normalizedGmail.isNotBlank() && it.gmailAddress.equals(normalizedGmail, ignoreCase = true)) ||
+                (normalizedNationalId.length == 14 && it.nationalId == normalizedNationalId)
         }
         if (existingIdx >= 0) {
             val existing = farmers[existingIdx]
             val updatedFarmer = existing.copy(
                 fullName = if (fullName.isNotBlank()) fullName.trim() else existing.fullName,
-                whatsappPhone = normalizedPhone,
-                gmailAddress = if (gmailInput.isNotBlank()) normalizedGmail else existing.gmailAddress,
-                nationalId = if (nationalIdInput.filter { it.isDigit() }.length == 14) normalizedNationalId else existing.nationalId,
-                region = regionName.ifBlank { existing.region }
+                whatsappPhone = if (normalizedPhone.isNotBlank()) normalizedPhone else existing.whatsappPhone,
+                gmailAddress = if (normalizedGmail.isNotBlank()) normalizedGmail else existing.gmailAddress,
+                nationalId = if (normalizedNationalId.length == 14) normalizedNationalId else existing.nationalId,
+                region = regionName.ifBlank { existing.region },
+                isDemoAccount = false
             )
             farmers[existingIdx] = updatedFarmer
             activeFarmerId = updatedFarmer.id
@@ -628,7 +626,12 @@ class DatabaseService(context: Context? = null) {
 
         val newFarmerId = "farmer_${farmers.size + 1}_${UUID.randomUUID().toString().take(4)}"
         val newFieldId = "field_${fields.size + 1}"
-        val cleanName = if (fullName.isBlank()) "المزارع الذكي (${normalizedPhone.takeLast(4)})" else fullName.trim()
+        val cleanName = if (fullName.isBlank()) {
+            val suffix = normalizedPhone.takeLast(4).ifBlank { normalizedNationalId.takeLast(4).ifBlank { "جديد" } }
+            "المزارع الذكي ($suffix)"
+        } else {
+            fullName.trim()
+        }
 
         val resolvedRole = if (normalizedGmail.equals(UserRole.BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true)) {
             UserRole.SUPER_ADMIN
@@ -645,7 +648,8 @@ class DatabaseService(context: Context? = null) {
             preferredAlertTime = "06:30 ص",
             role = resolvedRole,
             accountStatus = AccountStatus.ACTIVE,
-            lastLoginAt = currentTimeFormatted()
+            lastLoginAt = currentTimeFormatted(),
+            isDemoAccount = false
         )
         val newField = FieldEntity(
             id = newFieldId,
@@ -777,18 +781,19 @@ class DatabaseService(context: Context? = null) {
         whatsappMessages.clear()
         systemAuditEvents.clear()
 
-        // 0. Bootstrapped Owner Super Admin (elzahraafatma288@gmail.com)
+        // 0. Bootstrapped Owner Super Admin (elzahraafatma288@gmail.com) - no fabricated phone or National ID
         val fAdmin = FarmerEntity(
             id = "farmer_admin_owner",
             fullName = "م. فاطمة الزهراء (Super Admin)",
-            whatsappPhone = "+201000112233",
+            whatsappPhone = "",
             gmailAddress = UserRole.BOOTSTRAPPED_ADMIN_EMAIL,
-            nationalId = "29504120101488",
+            nationalId = "",
             region = "وادي النطرون",
             preferredAlertTime = "06:00 ص",
             role = UserRole.SUPER_ADMIN,
             accountStatus = AccountStatus.ACTIVE,
-            lastLoginAt = "08:00 ص"
+            lastLoginAt = "08:00 ص",
+            isDemoAccount = false
         )
         val fieldAdmin = FieldEntity(
             id = "field_admin_1",
@@ -829,18 +834,19 @@ class DatabaseService(context: Context? = null) {
         soilProfiles.add(soilAdmin)
         spectralScans.add(scanAdmin)
 
-        // Farmer 1: Wadi El Natrun (Tomato - Case A: Focal Late Blight Outbreak)
+        // Demo Sample Account 1: Wadi El Natrun (Tomato - Case A: Focal Late Blight Outbreak)
         val f1 = FarmerEntity(
             id = "farmer_1",
-            fullName = "الحاج محمود عبد الرحمن",
+            fullName = "الحاج محمود عبد الرحمن (نموذج استرشادي)",
             whatsappPhone = "+201012345678",
             gmailAddress = "mahmoud.amalfarm@gmail.com",
-            nationalId = "27805141801492",
+            nationalId = "",
             region = "وادي النطرون",
             preferredAlertTime = "06:00 ص",
             role = UserRole.FARMER,
             accountStatus = AccountStatus.ACTIVE,
-            lastLoginAt = "07:30 ص"
+            lastLoginAt = "07:30 ص",
+            isDemoAccount = true
         )
         val field1 = FieldEntity(
             id = "field_1",
@@ -877,18 +883,19 @@ class DatabaseService(context: Context? = null) {
             confidenceScore = 89
         )
 
-        // Farmer 2: New Salhia (Potato - Case B: Uniform Valve Irrigation Blockage)
+        // Demo Sample Account 2: New Salhia (Potato - Case B: Uniform Valve Irrigation Blockage)
         val f2 = FarmerEntity(
             id = "farmer_2",
-            fullName = "المهندس طارق السعيد",
+            fullName = "المهندس طارق السعيد (نموذج استرشادي)",
             whatsappPhone = "+201123456789",
             gmailAddress = "tarek.salhia.agro@gmail.com",
-            nationalId = "28509221302176",
+            nationalId = "",
             region = "الصالحية الجديدة",
             preferredAlertTime = "06:30 ص",
             role = UserRole.AGRONOMIST_ADMIN,
             accountStatus = AccountStatus.ACTIVE,
-            lastLoginAt = "07:45 ص"
+            lastLoginAt = "07:45 ص",
+            isDemoAccount = true
         )
         val field2 = FieldEntity(
             id = "field_2",
@@ -925,15 +932,16 @@ class DatabaseService(context: Context? = null) {
             confidenceScore = 94
         )
 
-        // Farmer 3: Farafra Oasis (Wheat - Case C: Soil pH > 7.5 Nutrient Lock-up)
+        // Demo Sample Account 3: Farafra Oasis (Wheat - Case C: Soil pH > 7.5 Nutrient Lock-up)
         val f3 = FarmerEntity(
             id = "farmer_3",
-            fullName = "الحاج عبد السلام الفرافرة",
+            fullName = "الحاج عبد السلام الفرافرة (نموذج استرشادي)",
             whatsappPhone = "+201234567890",
             gmailAddress = "abdelsalam.farafra@gmail.com",
-            nationalId = "27411033200851",
+            nationalId = "",
             region = "الفرافرة",
-            preferredAlertTime = "07:00 ص"
+            preferredAlertTime = "07:00 ص",
+            isDemoAccount = true
         )
         val field3 = FieldEntity(
             id = "field_3",
@@ -1245,6 +1253,7 @@ class DatabaseService(context: Context? = null) {
                     put("role", f.role.code)
                     put("accountStatus", f.accountStatus.code)
                     put("lastLoginAt", f.lastLoginAt)
+                    put("isDemoAccount", f.isDemoAccount)
                 }
             )
         }
@@ -1355,36 +1364,26 @@ class DatabaseService(context: Context? = null) {
             for (i in 0 until fArr.length()) {
                 val o = fArr.getJSONObject(i)
                 val fId = o.getString("id")
-                val defaultGmail = when (fId) {
-                    "farmer_1" -> "mahmoud.amalfarm@gmail.com"
-                    "farmer_2" -> "tarek.salhia.agro@gmail.com"
-                    "farmer_3" -> "abdelsalam.farafra@gmail.com"
-                    else -> "farmer.${o.getString("whatsappPhone").takeLast(4)}@gmail.com"
-                }
-                val defaultNationalId = when (fId) {
-                    "farmer_1" -> "27805141801492"
-                    "farmer_2" -> "28509221302176"
-                    "farmer_3" -> "27411033200851"
-                    else -> "28501011801234"
-                }
-                val resolvedGmail = o.optString("gmailAddress", "").ifBlank { defaultGmail }
+                val resolvedGmail = o.optString("gmailAddress", "")
                 val defaultRole = when {
                     resolvedGmail.equals(UserRole.BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) -> UserRole.SUPER_ADMIN
                     fId == "farmer_2" -> UserRole.AGRONOMIST_ADMIN
                     else -> UserRole.FARMER
                 }
+                val isDemo = o.optBoolean("isDemoAccount", fId in setOf("farmer_1", "farmer_2", "farmer_3"))
                 farmers.add(
                     FarmerEntity(
                         id = fId,
                         fullName = o.getString("fullName"),
-                        whatsappPhone = o.getString("whatsappPhone"),
+                        whatsappPhone = o.optString("whatsappPhone", ""),
                         gmailAddress = resolvedGmail,
-                        nationalId = o.optString("nationalId", "").ifBlank { defaultNationalId },
+                        nationalId = o.optString("nationalId", ""),
                         region = o.getString("region"),
                         preferredAlertTime = o.optString("preferredAlertTime", "06:00 ص"),
                         role = UserRole.fromCode(o.optString("role", defaultRole.code)),
                         accountStatus = AccountStatus.fromCode(o.optString("accountStatus", AccountStatus.ACTIVE.code)),
-                        lastLoginAt = o.optString("lastLoginAt", "08:00 ص")
+                        lastLoginAt = o.optString("lastLoginAt", "08:00 ص"),
+                        isDemoAccount = isDemo
                     )
                 )
             }
@@ -1502,28 +1501,28 @@ class DatabaseService(context: Context? = null) {
 
     companion object {
         fun normalizeEgyptianWhatsApp(raw: String): String {
+            if (raw.isBlank()) return ""
             val digits = raw.filter { it.isDigit() }
             return when {
                 digits.startsWith("201") && digits.length == 12 -> "+$digits"
                 digits.startsWith("01") && digits.length == 11 -> "+2$digits"
                 digits.length == 10 && digits.startsWith("1") -> "+20$digits"
-                else -> "+201012345678"
+                else -> ""
             }
         }
 
         fun normalizeGmailAddress(raw: String): String {
             val cleaned = raw.trim().lowercase()
-            if (cleaned.isBlank()) return "farmer.agrosight@gmail.com"
+            if (cleaned.isBlank()) return ""
             return if (cleaned.contains("@")) cleaned else "$cleaned@gmail.com"
         }
 
-        fun normalizeEgyptianNationalId(raw: String, fallbackSuffix: String = "1492"): String {
+        fun normalizeEgyptianNationalId(raw: String, fallbackSuffix: String = ""): String {
             val digits = raw.filter { it.isDigit() }
             return if (digits.length == 14) {
                 digits
             } else {
-                val safeSuffix = fallbackSuffix.filter { it.isDigit() }.padStart(4, '0').takeLast(4)
-                "2850514180$safeSuffix"
+                ""
             }
         }
 

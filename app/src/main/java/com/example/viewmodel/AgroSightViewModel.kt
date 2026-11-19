@@ -24,6 +24,7 @@ import com.example.data.FarmerCloudWorkspace
 import com.example.data.FarmerEntity
 import com.example.data.GeminiAgroService
 import com.example.data.GeminiAgronomyChatMessage
+import com.example.data.GeoreferencedRasterBackendResult
 import com.example.data.GroundingCitation
 import com.example.data.IrrigationAndTreatmentLogEntity
 import com.example.data.OpenMeteoClient
@@ -31,12 +32,14 @@ import com.example.data.OpenSourceSatelliteClient
 import com.example.data.RealSatelliteAndNasaTelemetry
 import com.example.data.RelationalDatabaseSnapshot
 import com.example.data.SatelliteEpidemiologyEngine
+import com.example.data.SatelliteRasterBackendRepository
 import com.example.data.ScientificFormulaCalculationAudit
 import com.example.data.SpectralRadarLayer
 import com.example.data.SqlFieldAuditEntity
 import com.example.data.WhatsAppAlertCategory
 import com.example.data.WhatsAppDirection
 import com.example.data.WhatsAppMessageEntity
+import com.example.data.buildFarmBoundaryGeoJsonPolygon
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.catch
@@ -150,10 +153,12 @@ data class AgroSightUiState(
     val isRunningDailyCronDispatch: Boolean = false,
     val cronProgressStatusAr: String = "",
     val lastCronDispatchSummary: DailyDispatchBatchSummary? = null,
-    // 11. Open-Source Satellite Imagery (Sentinel-2 STAC + WMTS Tile) & NASA POWER + Cited Formula Audit
+    // 11. Open-Source Satellite Imagery (Sentinel-2 STAC + WMTS Tile + Georeferenced Raster Engine) & NASA POWER + Cited Formula Audit
     val isSyncingOpenSourceSatellite: Boolean = false,
+    val isRunningGeoreferencedRasterJob: Boolean = false,
     val showRealOpticalSatelliteUnderlay: Boolean = true,
     val satelliteAndNasaTelemetry: RealSatelliteAndNasaTelemetry? = null,
+    val rasterBackendResult: GeoreferencedRasterBackendResult? = null,
     val formulaAudit: ScientificFormulaCalculationAudit,
     // 12. Firebase Auth + Firestore Cloud Persistence & Room SQL Database
     val firebaseUserUid: String? = null,
@@ -196,10 +201,12 @@ class AgroSightViewModel(
     private val sqlAuditDao = dependencies.sqlAuditDao
     private val openMeteoClient: MeteoForecastDataSource = dependencies.openMeteoClient
     private val openSourceSatelliteClient: SatelliteTelemetryDataSource = dependencies.openSourceSatelliteClient
+    private val satelliteRasterBackendRepository: SatelliteRasterBackendRepository = dependencies.satelliteRasterBackendRepository
     private val geminiAgroService: AgroAiCopilotDataSource = dependencies.geminiAgroService
     private val cloudWorker: AgroSightCloudWorker = dependencies.cloudWorker
     private val defaultFallbackMeteo = OpenMeteoClient()
     private var fetchJob: Job? = null
+    private var rasterJob: Job? = null
     private var firestoreWorkspaceJob: Job? = null
     private var firestoreChatLogsJob: Job? = null
 
@@ -527,6 +534,7 @@ class AgroSightViewModel(
             val updated = recalculateDerivedState(
                 state.copy(
                     activeAnomalyPattern = pattern,
+                    rasterBackendResult = null,
                     geminiEpidemiologyAnalysisText = ""
                 )
             )
@@ -538,6 +546,7 @@ class AgroSightViewModel(
             val newSnap = databaseService.recordSatelliteScan(newScanEntity)
             updated.copy(dbSnapshot = newSnap)
         }
+        runGeoreferencedRasterAnalysis()
     }
 
     fun runGeminiEpidemiologyAnalysis() {
@@ -1134,6 +1143,28 @@ class AgroSightViewModel(
                     latitude = snapshot.latitude,
                     longitude = snapshot.longitude
                 )
+                val polygonGeoJson = buildFarmBoundaryGeoJsonPolygon(
+                    centerLat = snapshot.latitude,
+                    centerLon = snapshot.longitude,
+                    areaFeddans = snapshot.areaFeddans
+                )
+                val stageIdx = when {
+                    snapshot.daysAfterSowing < 25 -> 0
+                    snapshot.daysAfterSowing < 50 -> 1
+                    snapshot.daysAfterSowing < 90 -> 2
+                    else -> 3
+                }
+                val rasterResult = satelliteRasterBackendRepository.runFullGeoreferencedSatelliteAnalysis(
+                    farmId = snapshot.fieldId,
+                    ownerUid = snapshot.firebaseUserUid ?: snapshot.activeFarmer.id,
+                    cropId = snapshot.selectedCrop.id,
+                    growthStageIndex = stageIdx,
+                    centerLat = snapshot.latitude,
+                    centerLon = snapshot.longitude,
+                    areaFeddans = snapshot.areaFeddans,
+                    customPolygonGeoJson = polygonGeoJson
+                ).getOrNull()
+
                 _uiState.update { current ->
                     recalculateDerivedState(
                         current.copy(
@@ -1141,7 +1172,8 @@ class AgroSightViewModel(
                             meteoStatusAr = result.statusMessageAr,
                             forecastDays = result.records,
                             climaticAlerts = result.alerts,
-                            satelliteAndNasaTelemetry = satAndNasa
+                            satelliteAndNasaTelemetry = satAndNasa,
+                            rasterBackendResult = rasterResult ?: current.rasterBackendResult
                         )
                     )
                 }
@@ -1154,6 +1186,54 @@ class AgroSightViewModel(
                         isSyncingOpenSourceSatellite = false
                     )
                 }
+            }
+        }
+    }
+
+    fun runGeoreferencedRasterAnalysis(
+        customPolygonGeoJson: String? = null,
+        explicitAuthToken: String? = null
+    ) {
+        rasterJob?.cancel()
+        rasterJob = viewModelScope.launch {
+            val snapshot = _uiState.value
+            _uiState.update { it.copy(isRunningGeoreferencedRasterJob = true) }
+            try {
+                val polygonGeoJson = customPolygonGeoJson ?: buildFarmBoundaryGeoJsonPolygon(
+                    centerLat = snapshot.latitude,
+                    centerLon = snapshot.longitude,
+                    areaFeddans = snapshot.areaFeddans
+                )
+                val stageIdx = when {
+                    snapshot.daysAfterSowing < 25 -> 0
+                    snapshot.daysAfterSowing < 50 -> 1
+                    snapshot.daysAfterSowing < 90 -> 2
+                    else -> 3
+                }
+                val rasterOutcome = satelliteRasterBackendRepository.runFullGeoreferencedSatelliteAnalysis(
+                    farmId = snapshot.fieldId,
+                    ownerUid = snapshot.firebaseUserUid ?: snapshot.activeFarmer.id,
+                    cropId = snapshot.selectedCrop.id,
+                    growthStageIndex = stageIdx,
+                    centerLat = snapshot.latitude,
+                    centerLon = snapshot.longitude,
+                    areaFeddans = snapshot.areaFeddans,
+                    customPolygonGeoJson = polygonGeoJson,
+                    explicitAuthToken = explicitAuthToken
+                )
+                rasterOutcome.onSuccess { rasterRes ->
+                    _uiState.update { current ->
+                        recalculateDerivedState(
+                            current.copy(
+                                rasterBackendResult = rasterRes
+                            )
+                        )
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } finally {
+                _uiState.update { it.copy(isRunningGeoreferencedRasterJob = false) }
             }
         }
     }
@@ -1197,13 +1277,34 @@ class AgroSightViewModel(
             activeAnomalyPattern = state.activeAnomalyPattern,
             databaseService = databaseService
         )
+        val rasterRes = state.rasterBackendResult
+        val mergedEpiReport = if (rasterRes != null && rasterRes.farmId == state.fieldId && rasterRes.pixelGrid.isNotEmpty()) {
+            derived.epidemiologyReport.copy(
+                ndviMean = rasterRes.ndviMean,
+                ndreMean = rasterRes.ndreMean,
+                ndmiMean = rasterRes.ndmiMean,
+                psriMean = rasterRes.psriMean,
+                pixelGrid = rasterRes.pixelGrid,
+                vegetationStressDetectionAr = rasterRes.vegetationStressDetectionAr,
+                agriculturalRiskAssessmentAr = rasterRes.agriculturalRiskAssessmentAr,
+                confirmedDiseaseDiagnosisStatusAr = rasterRes.confirmedDiseaseDiagnosisStatusAr,
+                dataModeDesignation = if (rasterRes.isLiveGeoreferencedRaster) {
+                    "LIVE_GEOREFERENCED_RASTER (EPSG:${rasterRes.crsEpsg} • ${rasterRes.spatialResolutionMeters.toInt()}m)"
+                } else {
+                    rasterRes.executionState.badgeAr
+                }
+            )
+        } else {
+            derived.epidemiologyReport
+        }
+
         return state.copy(
             growthEvaluation = derived.growthEvaluation,
             soilDiagnostics = derived.soilDiagnostics,
             valveSectors = derived.valveSectors,
             weeklySchedule = derived.weeklySchedule,
             whatIfResult = derived.whatIfResult,
-            epidemiologyReport = derived.epidemiologyReport,
+            epidemiologyReport = mergedEpiReport,
             formulaAudit = derived.formulaAudit,
             systemAnalytics = derived.systemAnalytics
         )
@@ -1584,6 +1685,35 @@ class AgroSightViewModel(
                             "تنبيه مزامنة Firestore: ${res.exceptionOrNull()?.localizedMessage ?: "خطأ"}"
                         }
                     )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } finally {
+                _uiState.update { it.copy(isFirebaseSyncing = false) }
+            }
+        }
+    }
+
+    fun deleteCurrentCloudWorkspace(targetUserId: String? = null) {
+        val st = _uiState.value
+        val uidToDelete = targetUserId ?: st.firebaseUserUid ?: return
+        if (st.isFirebaseSyncing) return
+        _uiState.update { it.copy(isFirebaseSyncing = true) }
+        viewModelScope.launch {
+            try {
+                val res = firestoreRepository.deleteCloudWorkspace(uidToDelete)
+                _uiState.update {
+                    if (res.isSuccess) {
+                        it.copy(
+                            cloudWorkspace = null,
+                            cloudChatLogs = emptyList(),
+                            firebaseCloudStatusAr = "تم حذف مساحة العمل السحابية وسجلات المحادثة بالكامل بنجاح ✅"
+                        )
+                    } else {
+                        it.copy(
+                            firebaseCloudStatusAr = "رفض حذف مساحة العمل: ${res.exceptionOrNull()?.message ?: "غير مصرح"}"
+                        )
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e

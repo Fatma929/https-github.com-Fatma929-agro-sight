@@ -467,17 +467,33 @@ class AgroSightFirestoreRepository(
     }
 
     override suspend fun deleteCloudWorkspace(userId: String): Result<Unit> {
-        val firestore = db ?: return Result.failure(IllegalStateException("Firestore not available"))
+        if (userId.isBlank()) {
+            return Result.failure(IllegalArgumentException("Blank userId"))
+        }
         val uid = auth?.currentUser?.uid ?: return Result.failure(IllegalStateException("Not signed in"))
-        if (userId.isBlank()) return Result.failure(IllegalArgumentException("Blank userId"))
+        if (uid != userId) {
+            return Result.failure(
+                SecurityException("Unauthorized workspace deletion: authenticated UID does not match requested userId")
+            )
+        }
+        val firestore = db ?: return Result.failure(IllegalStateException("Firestore not available"))
         return try {
-            val chatDocs = firestore.collection("users").document(userId)
-                .collection("chat_logs")
-                .limit(50)
-                .get()
-                .await()
-            for (doc in chatDocs.documents) {
-                doc.reference.delete().await()
+            val chatCollection = firestore.collection("users").document(userId).collection("chat_logs")
+            var batchIteration = 0
+            while (batchIteration < 50) {
+                batchIteration++
+                val pageSnapshot = chatCollection.limit(100).get().await()
+                if (pageSnapshot.isEmpty) {
+                    break
+                }
+                val writeBatch = firestore.batch()
+                for (doc in pageSnapshot.documents) {
+                    writeBatch.delete(doc.reference)
+                }
+                writeBatch.commit().await()
+                if (pageSnapshot.size() < 100) {
+                    break
+                }
             }
             firestore.collection("users").document(userId).delete().await()
             Result.success(Unit)
@@ -489,3 +505,4 @@ class AgroSightFirestoreRepository(
         }
     }
 }
+

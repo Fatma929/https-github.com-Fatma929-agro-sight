@@ -124,8 +124,19 @@ data class SpectralRasterStatistics(
     val geoJsonAnomalyPolygon: String
 )
 
+data class CropSpectralThresholdProfile(
+    val cropId: String,
+    val healthyNdviMin: Float,
+    val stressedNdviThreshold: Float,
+    val healthyNdreMin: Float,
+    val stressedNdreThreshold: Float,
+    val senescencePsriThreshold: Float,
+    val waterStressNdmiThreshold: Float
+)
+
 /**
- * Scientifically rigorous Sentinel-2 spectral band math and cloud/NoData masking engine.
+ * Scientifically rigorous Sentinel-2 spectral band math, multi-resolution alignment,
+ * polygon clipping, and cloud/NoData masking engine.
  * Formula definitions:
  * - NDVI = (B08 - B04) / (B08 + B04)
  * - NDRE = (B8A - B05) / (B8A + B05)
@@ -137,9 +148,63 @@ object Sentinel2BandMathEngine {
     private val MASKED_SCL_CLASSES = setOf(0, 1, 3, 8, 9, 10, 11)
     private const val EPSILON = 1e-6f
 
+    private val CROP_THRESHOLDS = mapOf(
+        "tomato" to CropSpectralThresholdProfile("tomato", 0.62f, 0.45f, 0.34f, 0.24f, 0.14f, 0.18f),
+        "potato" to CropSpectralThresholdProfile("potato", 0.65f, 0.48f, 0.36f, 0.25f, 0.13f, 0.20f),
+        "wheat" to CropSpectralThresholdProfile("wheat", 0.58f, 0.40f, 0.32f, 0.22f, 0.16f, 0.14f),
+        "corn" to CropSpectralThresholdProfile("corn", 0.64f, 0.46f, 0.35f, 0.24f, 0.14f, 0.18f),
+        "citrus" to CropSpectralThresholdProfile("citrus", 0.52f, 0.36f, 0.28f, 0.19f, 0.17f, 0.12f),
+        "date_palm" to CropSpectralThresholdProfile("date_palm", 0.42f, 0.28f, 0.23f, 0.15f, 0.20f, 0.08f),
+        "strawberry" to CropSpectralThresholdProfile("strawberry", 0.56f, 0.40f, 0.30f, 0.21f, 0.14f, 0.18f),
+        "sugar_beet" to CropSpectralThresholdProfile("sugar_beet", 0.60f, 0.43f, 0.33f, 0.23f, 0.15f, 0.16f)
+    )
+
+    fun getCropThresholds(cropIdOrName: String, growthStageIndex: Int = 2): CropSpectralThresholdProfile {
+        val key = when (cropIdOrName.trim().lowercase()) {
+            "طماطم" -> "tomato"
+            "بطاطس" -> "potato"
+            "قمح" -> "wheat"
+            "ذرة" -> "corn"
+            "موالح" -> "citrus"
+            "نخيل" -> "date_palm"
+            "فراولة" -> "strawberry"
+            "بنجر سكر" -> "sugar_beet"
+            else -> cropIdOrName.trim().lowercase()
+        }
+        val base = CROP_THRESHOLDS[key] ?: CROP_THRESHOLDS.getValue("tomato")
+        return when (growthStageIndex) {
+            0 -> base.copy(
+                healthyNdviMin = max(0.25f, base.healthyNdviMin - 0.22f),
+                stressedNdviThreshold = max(0.18f, base.stressedNdviThreshold - 0.18f),
+                healthyNdreMin = max(0.16f, base.healthyNdreMin - 0.12f),
+                stressedNdreThreshold = max(0.12f, base.stressedNdreThreshold - 0.09f),
+                senescencePsriThreshold = base.senescencePsriThreshold + 0.05f
+            )
+            3 -> base.copy(
+                healthyNdviMin = max(0.32f, base.healthyNdviMin - 0.14f),
+                stressedNdviThreshold = max(0.24f, base.stressedNdviThreshold - 0.10f),
+                healthyNdreMin = max(0.18f, base.healthyNdreMin - 0.10f),
+                stressedNdreThreshold = max(0.14f, base.stressedNdreThreshold - 0.07f),
+                senescencePsriThreshold = base.senescencePsriThreshold + 0.08f
+            )
+            else -> base
+        }
+    }
+
+    /**
+     * Converts Sentinel-2 L2A Digital Number (DN) to Bottom-Of-Atmosphere surface reflectance.
+     * Supports both pre-04.00 baseline (`offset = 0.0f`) and Processing Baseline 04.00+
+     * (`offset = -1000.0f` in DN units or `-0.1f` in reflectance units).
+     */
     fun convertDnToReflectance(rawDn: Int, scaleFactor: Float = 0.0001f, offset: Float = 0.0f): Float {
-        if (rawDn <= 0) return Float.NaN
-        return (rawDn * scaleFactor + offset)
+        if (rawDn <= 0 || rawDn >= 65535) return Float.NaN
+        val refl = if (kotlin.math.abs(offset) >= 1.0f) {
+            (rawDn.toFloat() + offset) * scaleFactor
+        } else {
+            rawDn.toFloat() * scaleFactor + offset
+        }
+        if (refl <= 0.0001f || refl > 1.5f) return Float.NaN
+        return refl.coerceAtMost(1.0f)
     }
 
     fun isCloudOrNoDataScl(sclClass: Int): Boolean = sclClass in MASKED_SCL_CLASSES
@@ -160,6 +225,95 @@ object Sentinel2BandMathEngine {
         }
         if (kotlin.math.abs(b06RedEdge2) < EPSILON) return null
         return ((b04Red - b02Blue) / b06RedEdge2).coerceIn(-1.0f, 1.5f)
+    }
+
+    /**
+     * Aligns a 20m Sentinel-2 band grid (B05, B06, B8A, B11, or SCL) to a 10m target grid (B02, B04, B08).
+     * Uses nearest-neighbor for categorical SCL and bilinear interpolation for continuous reflectance bands.
+     */
+    fun align20mGridTo10m(
+        grid20m: Array<FloatArray>,
+        targetRows: Int,
+        targetCols: Int,
+        isCategorical: Boolean = false
+    ): Array<FloatArray> {
+        val srcH = grid20m.size
+        val srcW = if (srcH > 0) grid20m[0].size else 0
+        if (srcH == 0 || srcW == 0) return Array(targetRows) { FloatArray(targetCols) { Float.NaN } }
+
+        val out = Array(targetRows) { FloatArray(targetCols) }
+        val scaleR = srcH.toFloat() / targetRows.toFloat()
+        val scaleC = srcW.toFloat() / targetCols.toFloat()
+
+        for (r in 0 until targetRows) {
+            for (c in 0 until targetCols) {
+                val srcRFrac = (r + 0.5f) * scaleR
+                val srcCFrac = (c + 0.5f) * scaleC
+                if (isCategorical) {
+                    val sr = srcRFrac.toInt().coerceIn(0, srcH - 1)
+                    val sc = srcCFrac.toInt().coerceIn(0, srcW - 1)
+                    out[r][c] = grid20m[sr][sc]
+                } else {
+                    val rCenter = (srcRFrac - 0.5f).coerceIn(0f, (srcH - 1).toFloat())
+                    val cCenter = (srcCFrac - 0.5f).coerceIn(0f, (srcW - 1).toFloat())
+                    val r0 = rCenter.toInt()
+                    val r1 = (r0 + 1).coerceAtMost(srcH - 1)
+                    val c0 = cCenter.toInt()
+                    val c1 = (c0 + 1).coerceAtMost(srcW - 1)
+                    val dr = rCenter - r0.toFloat()
+                    val dc = cCenter - c0.toFloat()
+                    val top = grid20m[r0][c0] * (1f - dc) + grid20m[r0][c1] * dc
+                    val bot = grid20m[r1][c0] * (1f - dc) + grid20m[r1][c1] * dc
+                    out[r][c] = top * (1f - dr) + bot * dr
+                }
+            }
+        }
+        return out
+    }
+
+    /**
+     * Ray-casting point-in-polygon check against a GeoJSON Polygon or Feature.
+     */
+    fun isPointInsideGeoJsonPolygon(lon: Double, lat: Double, polygonGeoJson: String): Boolean {
+        return try {
+            val obj = JSONObject(polygonGeoJson)
+            val geom = when (obj.optString("type")) {
+                "Feature" -> obj.optJSONObject("geometry") ?: return false
+                "FeatureCollection" -> obj.optJSONArray("features")?.optJSONObject(0)?.optJSONObject("geometry") ?: return false
+                else -> obj
+            }
+            if (geom.optString("type") != "Polygon") return false
+            val rings = geom.optJSONArray("coordinates") ?: return false
+            val outerRing = rings.optJSONArray(0) ?: return false
+            if (!isPointInRing(lon, lat, outerRing)) return false
+            for (h in 1 until rings.length()) {
+                val holeRing = rings.optJSONArray(h) ?: continue
+                if (isPointInRing(lon, lat, holeRing)) return false
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun isPointInRing(lon: Double, lat: Double, ring: org.json.JSONArray): Boolean {
+        val n = ring.length()
+        if (n < 3) return false
+        var inside = false
+        var j = n - 1
+        for (i in 0 until n) {
+            val pi = ring.optJSONArray(i) ?: continue
+            val pj = ring.optJSONArray(j) ?: continue
+            val xi = pi.optDouble(0)
+            val yi = pi.optDouble(1)
+            val xj = pj.optDouble(0)
+            val yj = pj.optDouble(1)
+            val denom = if (kotlin.math.abs(yj - yi) < 1e-12) 1e-12 else (yj - yi)
+            val intersects = ((yi > lat) != (yj > lat)) && (lon < (xj - xi) * (lat - yi) / denom + xi)
+            if (intersects) inside = !inside
+            j = i
+        }
+        return inside
     }
 
     fun evaluatePixel(sample: Sentinel2PixelReflectance): ComputedPixelIndices {
@@ -206,10 +360,80 @@ object Sentinel2BandMathEngine {
         )
     }
 
+    /**
+     * Vectorizes connected clusters of actual anomalous pixels into georeferenced GeoJSON polygons.
+     * NEVER emits a fixed square around the farm center: if no pixels are anomalous, returns `"features":[]`.
+     */
+    fun vectorizeAnomalousClustersToGeoJson(
+        anomalousPixels: List<ComputedPixelIndices>,
+        fieldLat: Double,
+        fieldLon: Double,
+        pixelStepDeg: Double = 0.0001
+    ): String {
+        if (anomalousPixels.isEmpty()) {
+            return """{"type":"FeatureCollection","features":[]}"""
+        }
+
+        val pixelMap = anomalousPixels.associateBy { it.row to it.col }
+        val visited = mutableSetOf<Pair<Int, Int>>()
+        val clusters = mutableListOf<List<ComputedPixelIndices>>()
+
+        for ((rc, _) in pixelMap) {
+            if (rc in visited) continue
+            val cluster = mutableListOf<ComputedPixelIndices>()
+            val queue = ArrayDeque<Pair<Int, Int>>()
+            queue.add(rc)
+            visited.add(rc)
+            while (queue.isNotEmpty()) {
+                val curr = queue.removeFirst()
+                pixelMap[curr]?.let { cluster.add(it) }
+                val neighbors = listOf(
+                    (curr.first - 1) to curr.second,
+                    (curr.first + 1) to curr.second,
+                    curr.first to (curr.second - 1),
+                    curr.first to (curr.second + 1)
+                )
+                for (nbr in neighbors) {
+                    if (nbr in pixelMap && nbr !in visited) {
+                        visited.add(nbr)
+                        queue.add(nbr)
+                    }
+                }
+            }
+            clusters.add(cluster)
+        }
+
+        val originLon = fieldLon - 0.0006
+        val originLat = fieldLat + 0.0004
+        val featuresJson = clusters.mapIndexed { idx, cluster ->
+            val minR = cluster.minOf { it.row }
+            val maxR = cluster.maxOf { it.row } + 1
+            val minC = cluster.minOf { it.col }
+            val maxC = cluster.maxOf { it.col } + 1
+
+            val lon0 = originLon + minC * pixelStepDeg
+            val lon1 = originLon + maxC * pixelStepDeg
+            val lat0 = originLat - minR * pixelStepDeg
+            val lat1 = originLat - maxR * pixelStepDeg
+
+            val cNdvi = cluster.mapNotNull { it.ndvi }.average().toFloat()
+            val cNdre = cluster.mapNotNull { it.ndre }.average().toFloat()
+            val cNdmi = cluster.mapNotNull { it.ndmi }.average().toFloat()
+            val cPsri = cluster.mapNotNull { it.psri }.average().toFloat()
+            val areaM2 = cluster.size * 100
+
+            """{"type":"Feature","properties":{"clusterId":"anomaly_${idx + 1}","pixelCount":${cluster.size},"areaM2":$areaM2,"ndviMean":${formatDecimal2(cNdvi)},"ndreMean":${formatDecimal2(cNdre)},"ndmiMean":${formatDecimal2(cNdmi)},"psriMean":${formatDecimal2(cPsri)}},"geometry":{"type":"Polygon","coordinates":[[[${formatCoord4(lon0)},${formatCoord4(lat0)}],[${formatCoord4(lon1)},${formatCoord4(lat0)}],[${formatCoord4(lon1)},${formatCoord4(lat1)}],[${formatCoord4(lon0)},${formatCoord4(lat1)}],[${formatCoord4(lon0)},${formatCoord4(lat0)}]]]}}"""
+        }
+
+        return """{"type":"FeatureCollection","features":[${featuresJson.joinToString(",")}]}"""
+    }
+
     fun aggregateRasterGrid(
         samples: List<Sentinel2PixelReflectance>,
         fieldLat: Double,
-        fieldLon: Double
+        fieldLon: Double,
+        cropId: String = "tomato",
+        growthStageIndex: Int = 2
     ): SpectralRasterStatistics {
         if (samples.isEmpty()) {
             return SpectralRasterStatistics(
@@ -266,10 +490,20 @@ object Sentinel2BandMathEngine {
             else -> "جودة منخفضة (${(validRatio * 100).roundToInt()}% بكسلات صالحة - غطاء سحابي كثيف)"
         }
 
-        val d = 0.0015
-        val geoJson = """
-            {"type":"FeatureCollection","features":[{"type":"Feature","properties":{"ndviMean":${formatDecimal2(ndviMean)},"ndreMean":${formatDecimal2(ndreMean)},"ndmiMean":${formatDecimal2(ndmiMean)},"psriMean":${formatDecimal2(psriMean)},"validPixelRatio":${formatDecimal2(validRatio)}},"geometry":{"type":"Polygon","coordinates":[[[${formatCoord4(fieldLon - d)},${formatCoord4(fieldLat - d)}],[${formatCoord4(fieldLon + d)},${formatCoord4(fieldLat - d)}],[${formatCoord4(fieldLon + d)},${formatCoord4(fieldLat + d)}],[${formatCoord4(fieldLon - d)},${formatCoord4(fieldLat + d)}],[${formatCoord4(fieldLon - d)},${formatCoord4(fieldLat - d)}]]]}}]}
-        """.trimIndent()
+        val thresholds = getCropThresholds(cropId, growthStageIndex)
+        val anomalousPixels = valid.filter { px ->
+            val ndvi = px.ndvi ?: 1.0f
+            val ndre = px.ndre ?: 1.0f
+            val psri = px.psri ?: 0.0f
+            ndvi < thresholds.stressedNdviThreshold ||
+                ndre < thresholds.stressedNdreThreshold ||
+                psri > thresholds.senescencePsriThreshold
+        }
+        val geoJson = vectorizeAnomalousClustersToGeoJson(
+            anomalousPixels = anomalousPixels,
+            fieldLat = fieldLat,
+            fieldLon = fieldLon
+        )
 
         return SpectralRasterStatistics(
             totalPixels = evaluated.size,
@@ -712,16 +946,28 @@ class OpenSourceSatelliteClient(
             StacAcquisitionStatus.MISSING_OR_INACCESSIBLE_ASSETS
         }
 
-        val validCount = temporalObservations.count { !it.isCloudGappedOrUnusable }
-        val cloudGapCount = temporalObservations.count { it.isCloudGappedOrUnusable }
+        val sortedTemporal = temporalObservations.sortedByDescending { it.acquisitionDateIso }
+        val validCount = sortedTemporal.count { !it.isCloudGappedOrUnusable }
+        val cloudGapCount = sortedTemporal.count { it.isCloudGappedOrUnusable }
+        val clearObsWithNdvi = sortedTemporal.filter { !it.isCloudGappedOrUnusable && it.observedNdviMean != null }
+        val ndviDelta = if (clearObsWithNdvi.size >= 2) {
+            (clearObsWithNdvi[0].observedNdviMean ?: 0f) - (clearObsWithNdvi[1].observedNdviMean ?: 0f)
+        } else null
+        val ndreDelta = if (clearObsWithNdvi.size >= 2) {
+            (clearObsWithNdvi[0].observedNdreMean ?: 0f) - (clearObsWithNdvi[1].observedNdreMean ?: 0f)
+        } else null
+        val ndmiDelta = if (clearObsWithNdvi.size >= 2) {
+            (clearObsWithNdvi[0].observedNdmiMean ?: 0f) - (clearObsWithNdvi[1].observedNdmiMean ?: 0f)
+        } else null
+
         val temporalSummary = TemporalChangeAnalysis(
-            observations = temporalObservations,
+            observations = sortedTemporal,
             validObservationCount = validCount,
             cloudGappedCount = cloudGapCount,
-            ndviChangeVsPrevious = null,
-            ndreChangeVsPrevious = null,
-            ndmiChangeVsPrevious = null,
-            temporalTrendSummaryAr = "تم رصد ${temporalObservations.size} مشاهد في أرشيف Sentinel-2 ($validCount صالحة، $cloudGapCount مستبعدة بسبب السحب >35%).",
+            ndviChangeVsPrevious = ndviDelta,
+            ndreChangeVsPrevious = ndreDelta,
+            ndmiChangeVsPrevious = ndmiDelta,
+            temporalTrendSummaryAr = "تم رصد ${sortedTemporal.size} مشاهد في أرشيف Sentinel-2 مرتبة زمنياً ($validCount صالحة، $cloudGapCount مستبعدة بسبب السحب >35%).",
             coverageGapDisclaimerAr = "ملاحظة علمية: الفجوات الزمنية الناتجة عن الغطاء السحابي تُستبعد تلقائياً ولا تُفسر كتدهور في الغطاء النباتي."
         )
 
