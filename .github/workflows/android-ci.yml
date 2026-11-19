@@ -1,0 +1,50 @@
+name: Android CI & Security Rules Verification
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Node.js 20 for Firestore Security Rules tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create safe .env from .env.example if missing
+        run: |
+          if [ ! -f .env ] && [ -f .env.example ]; then
+            cp .env.example .env
+          fi
+
+      - name: Run Unit & Robolectric Tests
+        run: gradle :app:testDebugUnitTest
+
+      - name: Assemble Debug APK
+        run: gradle :app:assembleDebug
+
+      - name: Compile Release Kotlin & Verify R8 Configuration
+        run: gradle :app:compileReleaseKotlin
+
+      - name: Install Firebase Rules Unit Testing Dependencies
+        if: hashFiles('package.json') != ''
+        run: npm ci || npm install
+
+      - name: Run Firestore Security Rules Tests (Emulator)
+        if: hashFiles('firestore.test.js') != ''
+        run: npx firebase emulators:exec --only firestore "node --test firestore.test.js"

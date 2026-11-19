@@ -1,0 +1,200 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Global primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Bootstrapped Super Admin email check (strictly requires email_verified == true against spoofing)
+    function isBootstrappedSuperAdmin() {
+      return isSignedIn() &&
+             'email' in request.auth.token &&
+             'email_verified' in request.auth.token &&
+             request.auth.token.email == 'elzahraafatma288@gmail.com' &&
+             request.auth.token.email_verified == true;
+    }
+
+    // RBAC Admin lookup: Bootstrapped Super Admin OR registered in /admins/{uid}
+    function isAdmin() {
+      return isBootstrappedSuperAdmin() ||
+             (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    // 3. Validation Blueprint: FarmerCloudWorkspace (/users/{userId})
+    function isValidFarmerWorkspace(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.role is string && data.role in ['SUPER_ADMIN', 'AGRONOMIST_ADMIN', 'FARMER'] &&
+             data.accountStatus is string && data.accountStatus in ['ACTIVE', 'SUSPENDED', 'PENDING_VERIFICATION'] &&
+             data.farmerName is string && data.farmerName.size() >= 2 && data.farmerName.size() <= 120 &&
+             data.whatsappPhone is string && data.whatsappPhone.size() >= 8 && data.whatsappPhone.size() <= 24 &&
+             data.gmailAddress is string && data.gmailAddress.size() >= 5 && data.gmailAddress.size() <= 120 &&
+             data.nationalId is string && data.nationalId.size() == 14 &&
+             data.fieldName is string && data.fieldName.size() >= 2 && data.fieldName.size() <= 150 &&
+             data.region is string && data.region.size() >= 2 && data.region.size() <= 100 &&
+             data.cropType is string && data.cropType.size() >= 2 && data.cropType.size() <= 80 &&
+             data.areaFeddans is number && data.areaFeddans >= 1 && data.areaFeddans <= 10000 &&
+             data.latitude is number && data.latitude >= -90 && data.latitude <= 90 &&
+             data.longitude is number && data.longitude >= -180 && data.longitude <= 180 &&
+             data.soilPh is number && data.soilPh >= 3.5 && data.soilPh <= 10.5 &&
+             data.soilEce is number && data.soilEce >= 0 && data.soilEce <= 50 &&
+             data.waterEcw is number && data.waterEcw >= 0 && data.waterEcw <= 50 &&
+             data.ndviMean is number && data.ndviMean >= -1 && data.ndviMean <= 1 &&
+             data.ndreMean is number && data.ndreMean >= -1 && data.ndreMean <= 1 &&
+             data.psriMean is number && data.psriMean >= -1 && data.psriMean <= 1 &&
+             data.ndmiMean is number && data.ndmiMean >= -1 && data.ndmiMean <= 1 &&
+             data.detectedRiskName is string && data.detectedRiskName.size() >= 2 && data.detectedRiskName.size() <= 200 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    // 4. Validation Blueprint: CloudChatLog (/users/{userId}/chat_logs/{logId})
+    function isValidCloudChatLog(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.role is string && data.role in ['USER', 'ASSISTANT', 'WHATSAPP_OUTBOUND'] &&
+             data.channel is string && data.channel in ['GEMINI_CHAT', 'VOICE_CONVERSATION', 'SEARCH_GROUNDED', 'MAPS_GROUNDED', 'WA_ME_DIRECT'] &&
+             data.messageText is string && data.messageText.size() >= 1 && data.messageText.size() <= 4000 &&
+             data.groundingSources is string && data.groundingSources.size() <= 1000 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    // 5. Validation Blueprint: AdminRegistryEntry (/admins/{adminUid})
+    function isValidAdminRegistryEntry(data, adminUid) {
+      return data.userId is string && data.userId == adminUid &&
+             data.email is string && data.email.size() >= 5 && data.email.size() <= 120 &&
+             data.role is string && data.role in ['SUPER_ADMIN', 'AGRONOMIST_ADMIN'] &&
+             data.grantedByUid is string && data.grantedByUid == request.auth.uid &&
+             data.createdAt is timestamp && data.createdAt <= request.time;
+    }
+
+    match /admins/{adminUid} {
+      allow get: if (isOwner(adminUid) || isAdmin()) && isValidId(adminUid);
+      allow list: if isAdmin();
+
+      allow create: if isBootstrappedSuperAdmin() &&
+                       isValidId(adminUid) &&
+                       incoming().keys().hasAll(['userId', 'email', 'role', 'grantedByUid', 'createdAt']) &&
+                       incoming().keys().hasOnly(['userId', 'email', 'role', 'grantedByUid', 'createdAt']) &&
+                       isValidAdminRegistryEntry(incoming(), adminUid);
+
+      allow update: if isBootstrappedSuperAdmin() &&
+                       isValidId(adminUid) &&
+                       isValidAdminRegistryEntry(incoming(), adminUid) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['email', 'role', 'grantedByUid']);
+
+      allow delete: if isBootstrappedSuperAdmin() && isValidId(adminUid);
+    }
+
+    match /users/{userId} {
+      allow get: if (isOwner(userId) || isAdmin()) && isValidId(userId);
+      allow list: if isOwner(userId) || isAdmin();
+
+      allow create: if isSignedIn() &&
+                       isValidId(userId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'role', 'accountStatus', 'farmerName', 'whatsappPhone', 'gmailAddress', 'nationalId',
+                         'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
+                         'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
+                         'detectedRiskName', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'role', 'accountStatus', 'farmerName', 'whatsappPhone', 'gmailAddress', 'nationalId',
+                         'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
+                         'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
+                         'detectedRiskName', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidFarmerWorkspace(incoming(), userId) &&
+                       (
+                         // Standard owner self-registration: prevented from self-assigning admin roles
+                         (isOwner(userId) && incoming().role == 'FARMER' && incoming().accountStatus == 'ACTIVE') ||
+                         // Bootstrapped Super Admin or Admin provisioning any role
+                         isAdmin()
+                       );
+
+      allow update: if isSignedIn() &&
+                       isValidId(userId) &&
+                       isValidFarmerWorkspace(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         // Action 1: Owner updating own telemetry/profile (cannot escalate role or accountStatus)
+                         (
+                           isOwner(userId) &&
+                           existing().accountStatus == 'ACTIVE' &&
+                           incoming().role == existing().role &&
+                           incoming().accountStatus == existing().accountStatus &&
+                           incoming().diff(existing()).affectedKeys().hasOnly([
+                             'farmerName', 'whatsappPhone', 'gmailAddress', 'nationalId',
+                             'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
+                             'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
+                             'detectedRiskName', 'updatedAt'
+                           ])
+                         ) ||
+                         // Action 2: Admin RBAC & record management override
+                         (
+                           isAdmin() &&
+                           incoming().diff(existing()).affectedKeys().hasOnly([
+                             'role', 'accountStatus', 'farmerName', 'whatsappPhone', 'gmailAddress', 'nationalId',
+                             'fieldName', 'region', 'cropType', 'areaFeddans', 'latitude', 'longitude',
+                             'soilPh', 'soilEce', 'waterEcw', 'ndviMean', 'ndreMean', 'psriMean', 'ndmiMean',
+                             'detectedRiskName', 'updatedAt'
+                           ])
+                         )
+                       );
+
+      allow delete: if (isOwner(userId) || isAdmin()) && isValidId(userId);
+
+      match /chat_logs/{logId} {
+        allow get: if (isOwner(userId) || isAdmin()) && isValidId(userId) && isValidId(logId);
+        allow list: if isOwner(userId) || isAdmin();
+
+        allow create: if (isOwner(userId) || isAdmin()) &&
+                         isValidId(userId) &&
+                         isValidId(logId) &&
+                         incoming().keys().hasAll([
+                           'userId', 'role', 'channel', 'messageText', 'groundingSources', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'role', 'channel', 'messageText', 'groundingSources', 'createdAt', 'updatedAt'
+                         ]) &&
+                         isValidCloudChatLog(incoming(), userId);
+
+        allow update: if (isOwner(userId) || isAdmin()) &&
+                         isValidId(userId) &&
+                         isValidId(logId) &&
+                         isValidCloudChatLog(incoming(), userId) &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'messageText', 'groundingSources', 'updatedAt'
+                         ]);
+
+        allow delete: if (isOwner(userId) || isAdmin()) && isValidId(userId) && isValidId(logId);
+      }
+    }
+  }
+}

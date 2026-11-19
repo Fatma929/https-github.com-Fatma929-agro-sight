@@ -1,0 +1,236 @@
+{
+  "entities": {
+    "FarmerCloudWorkspace": {
+      "title": "FarmerCloudWorkspace",
+      "description": "Cloud-synced AgroSight farmer profile, RBAC role, account status, field geometry, soil chemistry, and latest satellite spectral telemetry.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the farmer or user."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["SUPER_ADMIN", "AGRONOMIST_ADMIN", "FARMER"],
+          "description": "RBAC role assigned to the user. Non-admins can only self-register as FARMER."
+        },
+        "accountStatus": {
+          "type": "string",
+          "enum": ["ACTIVE", "SUSPENDED", "PENDING_VERIFICATION"],
+          "description": "Account lifecycle status managed by administrators."
+        },
+        "farmerName": {
+          "type": "string",
+          "description": "Arabic full name of the farmer."
+        },
+        "whatsappPhone": {
+          "type": "string",
+          "description": "Farmer WhatsApp number in +201xxxxxxxxx format."
+        },
+        "gmailAddress": {
+          "type": "string",
+          "description": "Farmer Gmail address."
+        },
+        "nationalId": {
+          "type": "string",
+          "description": "14-digit Egyptian National ID."
+        },
+        "fieldName": {
+          "type": "string",
+          "description": "Agricultural field name."
+        },
+        "region": {
+          "type": "string",
+          "description": "Egyptian agricultural zone name."
+        },
+        "cropType": {
+          "type": "string",
+          "description": "Crop name in Arabic."
+        },
+        "areaFeddans": {
+          "type": "number",
+          "description": "Field area in Feddans."
+        },
+        "latitude": {
+          "type": "number",
+          "description": "Field latitude coordinate."
+        },
+        "longitude": {
+          "type": "number",
+          "description": "Field longitude coordinate."
+        },
+        "soilPh": {
+          "type": "number",
+          "description": "Soil pH level (4.0 - 9.5)."
+        },
+        "soilEce": {
+          "type": "number",
+          "description": "Soil salinity ECe in dS/m."
+        },
+        "waterEcw": {
+          "type": "number",
+          "description": "Irrigation water salinity ECw in dS/m."
+        },
+        "ndviMean": {
+          "type": "number",
+          "description": "Sentinel-2 NDVI mean index."
+        },
+        "ndreMean": {
+          "type": "number",
+          "description": "Sentinel-2 NDRE Red-Edge chlorophyll index."
+        },
+        "psriMean": {
+          "type": "number",
+          "description": "Sentinel-2 PSRI plant senescence index."
+        },
+        "ndmiMean": {
+          "type": "number",
+          "description": "Sentinel-2 NDMI canopy moisture index."
+        },
+        "detectedRiskName": {
+          "type": "string",
+          "description": "Latest satellite-detected crop epidemiological diagnosis."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation server timestamp (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update server timestamp (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "role",
+        "accountStatus",
+        "farmerName",
+        "whatsappPhone",
+        "gmailAddress",
+        "nationalId",
+        "fieldName",
+        "region",
+        "cropType",
+        "areaFeddans",
+        "latitude",
+        "longitude",
+        "soilPh",
+        "soilEce",
+        "waterEcw",
+        "ndviMean",
+        "ndreMean",
+        "psriMean",
+        "ndmiMean",
+        "detectedRiskName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CloudChatLog": {
+      "title": "CloudChatLog",
+      "description": "Cloud-synced AI Agronomy Chatbot message or direct WhatsApp wa.me log owned by the signed-in farmer.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["USER", "ASSISTANT", "WHATSAPP_OUTBOUND"],
+          "description": "Sender role in the conversation or alert log."
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["GEMINI_CHAT", "VOICE_CONVERSATION", "SEARCH_GROUNDED", "MAPS_GROUNDED", "WA_ME_DIRECT"],
+          "description": "Interaction channel type."
+        },
+        "messageText": {
+          "type": "string",
+          "description": "Arabic message content."
+        },
+        "groundingSources": {
+          "type": "string",
+          "description": "Cited Google Search / Maps / FAO-56 / Sentinel-2 sources."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation server timestamp (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Update server timestamp (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "role",
+        "channel",
+        "messageText",
+        "groundingSources",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminRegistryEntry": {
+      "title": "AdminRegistryEntry",
+      "description": "Trusted RBAC administrator registry document in /admins/{adminUid}.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "UID of the administrator."
+        },
+        "email": {
+          "type": "string",
+          "description": "Verified administrator email."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["SUPER_ADMIN", "AGRONOMIST_ADMIN"],
+          "description": "Granted administrative tier."
+        },
+        "grantedByUid": {
+          "type": "string",
+          "description": "UID of the Super Admin who granted the role."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation server timestamp (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "email",
+        "role",
+        "grantedByUid",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/FarmerCloudWorkspace"
+      },
+      "description": "User-scoped AgroSight cloud workspace document storing farmer profile, RBAC role, account status, field, soil chemistry, and satellite indices."
+    },
+    "/users/{userId}/chat_logs/{logId}": {
+      "schema": {
+        "$ref": "#/entities/CloudChatLog"
+      },
+      "description": "User-scoped subcollection storing Gemini Agronomy AI chat history, voice transcripts, search/maps grounded insights, and direct wa.me logs."
+    },
+    "/admins/{adminUid}": {
+      "schema": {
+        "$ref": "#/entities/AdminRegistryEntry"
+      },
+      "description": "Trusted RBAC admin lookup collection controllable only by Super Admins."
+    }
+  }
+}

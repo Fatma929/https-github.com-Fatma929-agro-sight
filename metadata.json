@@ -1,0 +1,6 @@
+{
+  "name": "AgroSight",
+  "description": "أجرو سايت - منصة جدولة الري الذكي وتحليل التربة والأرصاد والأقمار الصناعية بدون حساسات",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
