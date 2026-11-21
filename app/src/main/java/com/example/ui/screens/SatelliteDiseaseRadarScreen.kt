@@ -26,6 +26,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CheckCircle
@@ -34,7 +35,6 @@ import androidx.compose.material.icons.filled.NoPhotography
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.SatelliteAlt
 import androidx.compose.material.icons.filled.Science
-import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material.icons.filled.WaterDrop
@@ -588,7 +588,7 @@ fun SatelliteDiseaseRadarScreen(
                             .testTag("send_disease_whatsapp_alert_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Send,
+                            imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = null,
                             modifier = Modifier.size(18.dp)
                         )

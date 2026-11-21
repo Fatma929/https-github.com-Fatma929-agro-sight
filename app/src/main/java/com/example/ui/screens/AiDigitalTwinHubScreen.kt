@@ -6,8 +6,9 @@ import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.net.Uri
 import android.os.Bundle
+import androidx.core.net.toUri
+import androidx.credentials.exceptions.NoCredentialException
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -41,6 +42,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CloudDone
@@ -51,7 +53,6 @@ import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.RecordVoiceOver
@@ -119,6 +120,7 @@ import com.example.ui.theme.SkyAccent
 import com.example.ui.theme.SkySoft
 import com.example.ui.theme.Slate100
 import com.example.ui.theme.Slate200
+import com.example.ui.theme.Slate400
 import com.example.ui.theme.Slate500
 import com.example.ui.theme.Slate600
 import com.example.ui.theme.Slate700
@@ -233,7 +235,7 @@ fun AiDigitalTwinHubScreen(
         var engine: TextToSpeech? = null
         engine = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                engine?.language = Locale("ar", "EG")
+                engine?.language = Locale.forLanguageTag("ar-EG")
                 engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         onSetVoiceSpeakingTtsState(true)
@@ -428,6 +430,8 @@ fun AiDigitalTwinHubScreen(
                 } else {
                     onGoogleSignInError("نوع بيانات اعتماد Google غير مدعوم")
                 }
+            } catch (e: NoCredentialException) {
+                onGoogleSignInError("لم يتم العثور على حساب Google مسجل على الجهاز (${e.localizedMessage ?: "NoCredentialException"})")
             } catch (e: Exception) {
                 onGoogleSignInError("تنبيه Google Sign-In: ${e.localizedMessage ?: "تأكد من تسجيل حساب Google على الجهاز"}")
             }
@@ -570,13 +574,20 @@ fun AiDigitalTwinHubScreen(
                 onToggleSearchGrounding = onToggleSearchGrounding,
                 onToggleMapsGrounding = onToggleMapsGrounding,
                 onToggleAutoSpeakTts = onToggleAutoSpeakTts,
-                onOpenDirectWaMeLink = onOpenDirectWaMeLink
+                onOpenDirectWaMeLink = onOpenDirectWaMeLink,
+                onSelectValveSector = onSelectValveSector,
+                onSelectZonePreset = onSelectZonePreset,
+                onOpenFullMapsTab = { activeSubTab = 1 }
             )
 
             1 -> ThreeJsDigitalTwinAndGoogleMapsSection(
                 uiState = uiState,
                 onSelectValveSector = onSelectValveSector,
-                onSelectZonePreset = onSelectZonePreset
+                onSelectZonePreset = onSelectZonePreset,
+                onAskGeminiAboutMapLocation = { prompt ->
+                    activeSubTab = 0
+                    onSendGeminiChatMessage(prompt, false, speakArabicText)
+                }
             )
 
             2 -> AgroAcousticMusicGeneratorSection(
@@ -598,6 +609,7 @@ fun AiDigitalTwinHubScreen(
     }
 }
 
+@SuppressLint("SetJavaScriptEnabled")
 @Composable
 private fun GeminiVoiceAndGroundedChatSection(
     uiState: AgroSightUiState,
@@ -609,17 +621,22 @@ private fun GeminiVoiceAndGroundedChatSection(
     onToggleSearchGrounding: () -> Unit,
     onToggleMapsGrounding: () -> Unit,
     onToggleAutoSpeakTts: () -> Unit,
-    onOpenDirectWaMeLink: (String, String) -> Unit
+    onOpenDirectWaMeLink: (String, String) -> Unit,
+    onSelectValveSector: (Int) -> Unit = {},
+    onSelectZonePreset: (EgyptianZonePreset) -> Unit = {},
+    onOpenFullMapsTab: () -> Unit = {}
 ) {
     var inputQuestion by remember { mutableStateOf("") }
     val context = LocalContext.current
+    val activeSector = uiState.valveSectors.find { it.valveNumber == uiState.selectedValveNumber }
+        ?: uiState.valveSectors.firstOrNull()
 
     // 1. Live Voice Conversation Studio Card
     HubBentoCard(modifier = Modifier.fillMaxWidth()) {
         HubSectionHeader(
             title = "المحادثة الصوتية الحية مع المستشار الزراعي (Gemini Voice Conversation)",
-            subtitle = "تحدث بالصوت مباشرة واستمع للرد المسموع بالعربية مع ربط حي ببيانات القمر الصناعي Sentinel-2",
-            badgeText = if (uiState.isVoiceListening) "🎙️ يستمع الآن..." else if (uiState.isVoiceSpeakingTts) "🔊 يتحدث الآن..." else "جاهز للصوت"
+            subtitle = "تحدث بالصوت مباشرة واستمع للرد المسموع بالعربية مع ربط حي ببيانات القمر الصناعي Sentinel-2 وخرائط Google Maps",
+            badgeText = if (uiState.isVoiceListening) "🎙️ يستمع الآن..." else if (uiState.isVoiceSpeakingTts) "🔊 يتحدث الآن..." else "Gemini 3.8 Flash Live"
         )
 
         Row(
@@ -712,7 +729,7 @@ private fun GeminiVoiceAndGroundedChatSection(
             val voicePresets = listOf(
                 "🎙️ كم ساعة أشغل المحبس اليوم وما جرعة الحامض لمعادلة pH؟",
                 "🎙️ هل الاصفرار في المحبس رقم 3 مرض فطري أم عطل ري؟",
-                "🎙️ ابحث في Google عن أفضل برنامج تسميد لمحصول ${uiState.selectedCrop.nameAr} في ${uiState.activeFarmer.region}"
+                "🎙️ حلل موقع الحقل على Google Maps (${uiState.latitude}, ${uiState.longitude}) لمحصول ${uiState.selectedCrop.nameAr}"
             )
             voicePresets.forEachIndexed { idx, preset ->
                 Surface(
@@ -735,11 +752,161 @@ private fun GeminiVoiceAndGroundedChatSection(
         }
     }
 
+    // 1B. Embedded Interactive Google Maps Satellite + Chatbot Spatial Connector Card
+    HubBentoCard(modifier = Modifier.fillMaxWidth()) {
+        HubSectionHeader(
+            title = "ربط خرائط Google Maps Satellite المباشر مع شات Gemini",
+            subtitle = "اختر المنطقة أو قطاع المحبس على خريطة Google Maps واسأل الشات الذكي فوراً عن حالته الطيفية",
+            badgeText = "Google Maps + Gemini"
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            EGYPTIAN_ZONE_PRESETS.forEach { preset ->
+                FilterChip(
+                    selected = uiState.selectedZoneId == preset.id,
+                    onClick = { onSelectZonePreset(preset) },
+                    label = { Text(preset.nameAr) },
+                    leadingIcon = {
+                        Icon(Icons.Default.LocationOn, contentDescription = null, modifier = Modifier.size(14.dp))
+                    }
+                )
+            }
+        }
+
+        val interactiveGoogleMapsHtml = remember(
+            uiState.latitude,
+            uiState.longitude,
+            uiState.fieldName,
+            uiState.selectedValveNumber,
+            uiState.epidemiologyReport.ndviMean
+        ) {
+            buildInteractiveGoogleMapsLeafletHtml(
+                latitude = uiState.latitude,
+                longitude = uiState.longitude,
+                fieldName = uiState.fieldName,
+                cropNameAr = uiState.selectedCrop.nameAr,
+                selectedValve = uiState.selectedValveNumber,
+                ndviMean = uiState.epidemiologyReport.ndviMean,
+                sectors = uiState.valveSectors
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(210.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .border(1.dp, SkyAccent.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        webViewClient = WebViewClient()
+                    }
+                },
+                update = { webView ->
+                    webView.loadDataWithBaseURL(
+                        "https://maps.google.com",
+                        interactiveGoogleMapsHtml,
+                        "text/html",
+                        "UTF-8",
+                        null
+                    )
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("chatbot_embedded_google_maps_webview")
+            )
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            (1..6).forEach { vNum ->
+                val sec = uiState.valveSectors.find { it.valveNumber == vNum }
+                FilterChip(
+                    selected = uiState.selectedValveNumber == vNum,
+                    onClick = { onSelectValveSector(vNum) },
+                    label = {
+                        Text(
+                            if (sec != null) {
+                                "محبس $vNum (NDVI ${formatDecimal2(sec.ndvi)})"
+                            } else {
+                                "محبس $vNum"
+                            }
+                        )
+                    }
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = {
+                    val sectorInfo = if (activeSector != null) {
+                        "محبس رقم ${activeSector.valveNumber} (${activeSector.nameAr}) حيث NDVI=${formatDecimal2(activeSector.ndvi)} وNDWI=${formatDecimal2(activeSector.ndwi)} وزمن الري=${formatDecimal1(activeSector.operatingHours)} ساعة"
+                    } else {
+                        "محبس رقم ${uiState.selectedValveNumber}"
+                    }
+                    onSendChatMessage(
+                        "حلل لي على خريطة Google Maps عند الإحداثيات (${uiState.latitude}, ${uiState.longitude}) حالة $sectorInfo في ${uiState.fieldName} وأعطني توصية الري والتسميد الدقيقة.",
+                        false
+                    )
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = EmeraldPrimary),
+                modifier = Modifier
+                    .weight(1.25f)
+                    .testTag("ask_gemini_from_google_map_btn")
+            ) {
+                Icon(Icons.Default.Map, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("اسأل شات Gemini عن هذا القطاع", style = MaterialTheme.typography.labelMedium)
+            }
+
+            OutlinedButton(
+                onClick = {
+                    try {
+                        val uri = "https://www.google.com/maps/search/?api=1&query=${uiState.latitude},${uiState.longitude}".toUri()
+                        context.startActivity(Intent(Intent.ACTION_VIEW, uri))
+                    } catch (_: Exception) {
+                    }
+                },
+                modifier = Modifier
+                    .weight(0.9f)
+                    .testTag("open_google_maps_from_chat_btn")
+            ) {
+                Icon(Icons.Default.Public, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("فتح Google Maps", style = MaterialTheme.typography.labelMedium)
+            }
+
+            OutlinedButton(
+                onClick = onOpenFullMapsTab,
+                modifier = Modifier.testTag("expand_3d_google_maps_tab_btn")
+            ) {
+                Text("3D", style = MaterialTheme.typography.labelMedium)
+            }
+        }
+    }
+
     // 2. Multi-Turn Gemini Chatbot with Google Search & Google Maps Grounding
     HubBentoCard(modifier = Modifier.fillMaxWidth()) {
         HubSectionHeader(
             title = "شات المستشار الزراعي متعدد الجولات (Gemini Chatbot + Google Search & Maps)",
-            subtitle = "مدعوم ببيانات بحث Google الحية وخرائط Google Maps وبصمة Sentinel-2",
+            subtitle = "مدعوم بنموذج Gemini 3.8 Flash وبيانات بحث Google الحية وخرائط Google Maps وبصمة Sentinel-2",
             badgeText = "${uiState.geminiChatMessages.size} رسالة"
         )
 
@@ -791,13 +958,15 @@ private fun GeminiVoiceAndGroundedChatSection(
             uiState.geminiChatMessages.forEach { msg ->
                 GeminiGroundedChatBubble(
                     message = msg,
+                    latitude = uiState.latitude,
+                    longitude = uiState.longitude,
                     onSpeakMessage = { onSpeakText(msg.text) },
                     onShareViaWaMe = {
                         onOpenDirectWaMeLink(uiState.activeFarmer.whatsappPhone, msg.text)
                     },
                     onOpenCitationUrl = { url ->
                         try {
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                            val intent = Intent(Intent.ACTION_VIEW, url.toUri())
                             context.startActivity(intent)
                         } catch (_: Exception) {
                         }
@@ -815,7 +984,7 @@ private fun GeminiVoiceAndGroundedChatSection(
                 ) {
                     CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = EmeraldPrimary)
                     Text(
-                        text = "جاري تحليل البصمة الطيفية والبحث في Google Search وGoogle Maps...",
+                        text = "جاري تحليل البصمة الطيفية والبحث في Google Search وGoogle Maps عبر Gemini AI...",
                         style = MaterialTheme.typography.labelMedium,
                         color = EmeraldDark,
                         fontWeight = FontWeight.Bold
@@ -860,6 +1029,8 @@ private fun GeminiVoiceAndGroundedChatSection(
 @Composable
 private fun GeminiGroundedChatBubble(
     message: GeminiAgronomyChatMessage,
+    latitude: Double,
+    longitude: Double,
     onSpeakMessage: () -> Unit,
     onShareViaWaMe: () -> Unit,
     onOpenCitationUrl: (String) -> Unit
@@ -880,12 +1051,33 @@ private fun GeminiGroundedChatBubble(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = if (isUser) "👨‍🌾 المزارع (${message.channel})" else "🛰️ المستشار الذكي Gemini (${message.channel})",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (isUser) EmeraldDark else SkyAccent,
-                    fontWeight = FontWeight.Bold
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        text = if (isUser) "👨‍🌾 المزارع (${message.channel})" else "🛰️ المستشار الذكي Gemini (${message.channel})",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (isUser) EmeraldDark else SkyAccent,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (!isUser) {
+                        Surface(
+                            color = if (message.isLiveAiGenerated) EmeraldSoft else Slate100,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(1.dp, if (message.isLiveAiGenerated) EmeraldPrimary else Slate400)
+                        ) {
+                            Text(
+                                text = if (message.isLiveAiGenerated) "✨ Gemini 3.8 Live" else "⚡ تحليل محلي + Maps",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (message.isLiveAiGenerated) EmeraldDark else Slate700,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = message.timestamp,
@@ -939,7 +1131,7 @@ private fun GeminiGroundedChatBubble(
                                 horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.OpenInNew,
+                                    imageVector = Icons.AutoMirrored.Filled.OpenInNew,
                                     contentDescription = null,
                                     tint = SkyAccent,
                                     modifier = Modifier.size(12.dp)
@@ -959,8 +1151,25 @@ private fun GeminiGroundedChatBubble(
             if (!isUser) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.Start)
                 ) {
+                    Surface(
+                        color = SkySoft,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, SkyAccent.copy(alpha = 0.4f)),
+                        modifier = Modifier.clickable {
+                            onOpenCitationUrl("https://www.google.com/maps/search/?api=1&query=$latitude,$longitude")
+                        }
+                    ) {
+                        Text(
+                            text = "📍 الموقع على Google Maps",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SkyAccent,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+
                     Surface(
                         color = EmeraldSoft,
                         shape = RoundedCornerShape(8.dp),
@@ -968,7 +1177,7 @@ private fun GeminiGroundedChatBubble(
                         modifier = Modifier.clickable { onShareViaWaMe() }
                     ) {
                         Text(
-                            text = "📲 إرسال التوصية عبر رابط واتساب المباشر (wa.me)",
+                            text = "📲 إرسال عبر واتساب (wa.me)",
                             style = MaterialTheme.typography.labelSmall,
                             color = EmeraldDark,
                             fontWeight = FontWeight.Bold,
@@ -986,7 +1195,8 @@ private fun GeminiGroundedChatBubble(
 private fun ThreeJsDigitalTwinAndGoogleMapsSection(
     uiState: AgroSightUiState,
     onSelectValveSector: (Int) -> Unit,
-    onSelectZonePreset: (EgyptianZonePreset) -> Unit
+    onSelectZonePreset: (EgyptianZonePreset) -> Unit,
+    onAskGeminiAboutMapLocation: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     var cameraElevationDeg by remember { mutableFloatStateOf(42f) }
@@ -1078,7 +1288,7 @@ private fun ThreeJsDigitalTwinAndGoogleMapsSection(
     HubBentoCard(modifier = Modifier.fillMaxWidth()) {
         HubSectionHeader(
             title = "خريطة Google Maps التفاعلية وإحداثيات الحقل الفضائية",
-            subtitle = "ربط مباشر مع Google Maps Satellite وبيانات المناطق الزراعية المصرية (${uiState.latitude}, ${uiState.longitude})",
+            subtitle = "ربط مباشر مع Google Maps Satellite Hybrid ومضلعات المحابس الـ 6 وشات Gemini الذكي (${uiState.latitude}, ${uiState.longitude})",
             badgeText = uiState.activeFarmer.region
         )
 
@@ -1101,32 +1311,28 @@ private fun ThreeJsDigitalTwinAndGoogleMapsSection(
             }
         }
 
-        val googleMapsHtml = remember(uiState.latitude, uiState.longitude, uiState.fieldName) {
-            """
-            <!DOCTYPE html>
-            <html dir="rtl">
-            <head>
-              <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <style>body,html{margin:0;padding:0;height:100%;background:#0f172a;}</style>
-            </head>
-            <body>
-              <iframe
-                width="100%"
-                height="100%"
-                frameborder="0"
-                style="border:0;"
-                src="https://maps.google.com/maps?q=${uiState.latitude},${uiState.longitude}&t=k&z=15&output=embed"
-                allowfullscreen>
-              </iframe>
-            </body>
-            </html>
-            """.trimIndent()
+        val googleMapsHtml = remember(
+            uiState.latitude,
+            uiState.longitude,
+            uiState.fieldName,
+            uiState.selectedValveNumber,
+            uiState.epidemiologyReport.ndviMean
+        ) {
+            buildInteractiveGoogleMapsLeafletHtml(
+                latitude = uiState.latitude,
+                longitude = uiState.longitude,
+                fieldName = uiState.fieldName,
+                cropNameAr = uiState.selectedCrop.nameAr,
+                selectedValve = uiState.selectedValveNumber,
+                ndviMean = uiState.epidemiologyReport.ndviMean,
+                sectors = uiState.valveSectors
+            )
         }
 
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(250.dp)
+                .height(275.dp)
                 .clip(RoundedCornerShape(16.dp))
                 .border(1.dp, SkyAccent.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
         ) {
@@ -1153,31 +1359,49 @@ private fun ThreeJsDigitalTwinAndGoogleMapsSection(
             )
         }
 
+        Text(
+            text = "📍 الإحداثيات الفضائية: Lat ${uiState.latitude} • Lon ${uiState.longitude} (${uiState.areaFeddans.toInt()} فدان • محبس ${uiState.selectedValveNumber})",
+            style = MaterialTheme.typography.labelMedium,
+            color = Slate700,
+            fontWeight = FontWeight.Bold
+        )
+
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(
-                text = "📍 الإحداثيات: Lat ${uiState.latitude} • Lon ${uiState.longitude} (${uiState.areaFeddans.toInt()} فدان)",
-                style = MaterialTheme.typography.labelMedium,
-                color = Slate700,
-                fontWeight = FontWeight.Bold
-            )
+            Button(
+                onClick = {
+                    onAskGeminiAboutMapLocation(
+                        "حلل لي الموقع الفضائي على Google Maps عند (${uiState.latitude}, ${uiState.longitude}) لمحصول ${uiState.selectedCrop.nameAr} في ${uiState.fieldName} (محبس رقم ${uiState.selectedValveNumber}) وما أفضل خطة ري وتسميد؟"
+                    )
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = EmeraldPrimary),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("ask_gemini_from_3d_maps_tab_button")
+            ) {
+                Icon(Icons.Default.RecordVoiceOver, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("اسأل شات Gemini عن هذا الموقع")
+            }
+
             Button(
                 onClick = {
                     try {
-                        val uri = Uri.parse("https://www.google.com/maps/search/?api=1&query=${uiState.latitude},${uiState.longitude}")
+                        val uri = "https://www.google.com/maps/search/?api=1&query=${uiState.latitude},${uiState.longitude}".toUri()
                         context.startActivity(Intent(Intent.ACTION_VIEW, uri))
                     } catch (_: Exception) {
                     }
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
-                modifier = Modifier.testTag("open_external_google_maps_button")
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("open_external_google_maps_button")
             ) {
                 Icon(Icons.Default.Public, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("فتح في تطبيق Google Maps")
+                Text("فتح في Google Maps")
             }
         }
     }
@@ -1623,3 +1847,98 @@ private fun buildThreeJsFarmSceneHtml(
 </html>
     """.trimIndent()
 }
+
+fun buildInteractiveGoogleMapsLeafletHtml(
+    latitude: Double,
+    longitude: Double,
+    fieldName: String,
+    cropNameAr: String,
+    selectedValve: Int,
+    ndviMean: Float,
+    sectors: List<com.example.model.ValveSectorTelemetry>
+): String {
+    val sectorJsArray = if (sectors.isNotEmpty()) {
+        sectors.joinToString(",") { sec ->
+            "{v:${sec.valveNumber},name:'${sec.nameAr}',ndvi:${formatDecimal2(sec.ndvi)},ndwi:${formatDecimal2(sec.ndwi)},hrs:${formatDecimal1(sec.operatingHours)}}"
+        }
+    } else {
+        (1..6).joinToString(",") { v ->
+            "{v:$v,name:'محبس $v',ndvi:${formatDecimal2(ndviMean)},ndwi:0.24,hrs:2.3}"
+        }
+    }
+    return """
+<!DOCTYPE html>
+<html dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #07111e; font-family: sans-serif; }
+    #map { width: 100%; height: 100%; }
+    .hud-overlay {
+      position: absolute; top: 8px; right: 8px; left: 8px; z-index: 999;
+      background: rgba(15, 23, 42, 0.86); color: #fff; border: 1px solid #38bdf8;
+      border-radius: 10px; padding: 6px 10px; font-size: 11px;
+      display: flex; justify-content: space-between; align-items: center;
+      pointer-events: none;
+    }
+    .gmaps-badge { color: #38bdf8; font-weight: bold; }
+    .ndvi-badge { color: #34d399; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="hud-overlay">
+    <div class="gmaps-badge">🗺️ Google Maps Satellite • $fieldName ($cropNameAr)</div>
+    <div class="ndvi-badge">محبس #$selectedValve • NDVI ${formatDecimal2(ndviMean)}</div>
+  </div>
+  <div id="map"></div>
+  <script>
+    (function() {
+      const lat = $latitude;
+      const lon = $longitude;
+      const selValve = $selectedValve;
+      const sectors = [$sectorJsArray];
+
+      if (typeof L !== 'undefined') {
+        const map = L.map('map', { zoomControl: true, attributionControl: false }).setView([lat, lon], 16);
+        L.tileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
+          maxZoom: 20
+        }).addTo(L);
+
+        const dLat = 0.0014;
+        const dLon = 0.0016;
+        sectors.forEach(function(sec, idx) {
+          const row = Math.floor(idx / 3);
+          const col = idx % 3;
+          const sLat = lat + (0.5 - row) * dLat;
+          const sLon = lon + (col - 1) * dLon;
+          const isSelected = (sec.v === selValve);
+          const color = sec.ndvi >= 0.62 ? '#10b981' : (sec.ndvi >= 0.50 ? '#f59e0b' : '#ef4444');
+          const bounds = [
+            [sLat - dLat * 0.44, sLon - dLon * 0.44],
+            [sLat + dLat * 0.44, sLon + dLon * 0.44]
+          ];
+          const rect = L.rectangle(bounds, {
+            color: isSelected ? '#ffffff' : color,
+            weight: isSelected ? 3 : 1.5,
+            fillColor: color,
+            fillOpacity: isSelected ? 0.52 : 0.32
+          }).addTo(map);
+          rect.bindPopup('<b>' + sec.name + '</b><br/>NDVI: ' + sec.ndvi + ' | NDWI: ' + sec.ndwi + '<br/>زمن الري: ' + sec.hrs + ' ساعة');
+          if (isSelected) {
+            rect.openPopup();
+          }
+        });
+      } else {
+        document.getElementById('map').innerHTML =
+          '<iframe width="100%" height="100%" frameborder="0" style="border:0;" src="https://maps.google.com/maps?q=' + lat + ',' + lon + '&t=k&z=16&output=embed"></iframe>';
+      }
+    })();
+  </script>
+</body>
+</html>
+    """.trimIndent()
+}
+

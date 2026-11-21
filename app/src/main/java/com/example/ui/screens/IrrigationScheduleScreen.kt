@@ -58,6 +58,7 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,10 +67,12 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -681,7 +684,7 @@ private fun WeeklyTimetableDayCard(
                 }
             }
 
-            Column(horizontalAlignment = Alignment.End) {
+            Column(horizontalAlignment = Alignment.Start) {
                 Text(
                     text = formatHoursMinutesClean(item.valveRunHours),
                     style = MaterialTheme.typography.titleSmall,
@@ -779,6 +782,7 @@ fun PrintableIrrigationReportDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Surface(
             modifier = Modifier
                 .fillMaxSize()
@@ -1036,6 +1040,7 @@ fun PrintableIrrigationReportDialog(
                     }
                 }
             }
+        }
         }
     }
 }

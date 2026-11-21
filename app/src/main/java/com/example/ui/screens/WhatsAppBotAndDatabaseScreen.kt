@@ -59,6 +59,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,11 +70,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -895,7 +898,7 @@ private fun WhatsAppMessageBubble(
             // Direct https://wa.me/ launcher button for every logged message
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
+                horizontalArrangement = Arrangement.Start
             ) {
                 Surface(
                     color = Color(0xFF075E54).copy(alpha = 0.10f),
@@ -988,6 +991,7 @@ fun FarmerWhatsAppAuthDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Surface(
             shape = RoundedCornerShape(22.dp),
             color = Color.White,
@@ -1577,6 +1581,7 @@ fun FarmerWhatsAppAuthDialog(
                 }
             }
         }
+        }
     }
 }
 
@@ -1597,6 +1602,7 @@ fun RelationalDatabaseSchemaDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Surface(
             modifier = Modifier
                 .fillMaxSize()
@@ -1727,6 +1733,7 @@ fun RelationalDatabaseSchemaDialog(
                     }
                 }
             }
+        }
         }
     }
 }

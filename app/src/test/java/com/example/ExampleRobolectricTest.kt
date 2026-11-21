@@ -372,6 +372,13 @@ class ExampleRobolectricTest {
     @Test
     fun `AgroSightViewModel initializes with 7-day irrigation schedule and enforces RBAC on admin actions`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
+        // Verify standard ViewModelProvider.AndroidViewModelFactory reflection instantiation succeeds
+        val reflectedVm = androidx.lifecycle.ViewModelProvider(
+            androidx.lifecycle.ViewModelStore(),
+            androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.getInstance(app)
+        )[AgroSightViewModel::class.java]
+        assertNotNull("AndroidViewModelFactory must instantiate AgroSightViewModel via reflection", reflectedVm)
+
         val viewModel = buildTestViewModel(app)
 
         val initialState = viewModel.uiState.value
@@ -548,6 +555,505 @@ class ExampleRobolectricTest {
         val ownerRes = kotlinx.coroutines.runBlocking { repo.deleteCloudWorkspace("farmer_alice_123") }
         assertTrue(ownerRes.isSuccess)
     }
-}
 
+    @Test
+    fun `RetrofitSatelliteRasterBackendRepository executes token refresh on 401, submits job, polls 9-stage lifecycle, and retrieves georeferenced result`() {
+        val jsonMediaType = with(okhttp3.MediaType) { "application/json".toMediaType() }
+        var tokenRefreshRequested = false
+        val tokenProvider = com.example.data.FirebaseIdTokenProvider { forceRefresh ->
+            if (forceRefresh) {
+                tokenRefreshRequested = true
+                "fresh_firebase_id_token_v2"
+            } else {
+                "expired_firebase_id_token_v1"
+            }
+        }
+
+        var jobPollCount = 0
+        val pollStates = listOf(
+            "QUEUED" to 10,
+            "DISCOVERING_SCENES" to 20,
+            "DOWNLOADING_ASSETS" to 35,
+            "PROCESSING_RASTERS" to 55,
+            "CALCULATING_INDICES" to 75,
+            "GENERATING_OUTPUTS" to 90,
+            "COMPLETED" to 100
+        )
+
+        val mockInterceptor = okhttp3.Interceptor { chain ->
+            val req = chain.request()
+            val path = req.url.encodedPath
+            val authHeader = req.header("Authorization").orEmpty()
+
+            if (authHeader == "Bearer expired_firebase_id_token_v1") {
+                return@Interceptor okhttp3.Response.Builder()
+                    .request(req)
+                    .protocol(okhttp3.Protocol.HTTP_1_1)
+                    .code(401)
+                    .message("Unauthorized")
+                    .body(
+                        with(okhttp3.ResponseBody) {
+                            """{"detail":{"error_code":"TOKEN_EXPIRED","message":"Firebase ID token has expired"}}"""
+                                .toResponseBody(jsonMediaType)
+                        }
+                    )
+                    .build()
+            }
+
+            assertEquals("Bearer fresh_firebase_id_token_v2", authHeader)
+
+            val responseJson = when {
+                path.endsWith("/api/v1/satellite/scenes") -> {
+                    """
+                    {
+                      "farm_id": "farm_wadi_1",
+                      "scene_count": 1,
+                      "scenes": [
+                        {
+                          "scene_id": "S2A_36RTU_20261118_1_L2A",
+                          "scale_factor": 0.0001,
+                          "boa_add_offset": -1000.0,
+                          "band_assets": {"B04": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B04.tif"}
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                }
+                path.endsWith("/api/v1/satellite/process") -> {
+                    """
+                    {
+                      "job_id": "job_live_001",
+                      "result_id": "res_live_001",
+                      "farm_id": "farm_wadi_1",
+                      "owner_uid": "farmer_uid_1",
+                      "status": "QUEUED",
+                      "progress_pct": 5
+                    }
+                    """.trimIndent()
+                }
+                path.contains("/api/v1/satellite/jobs/") -> {
+                    val idx = jobPollCount.coerceAtMost(pollStates.lastIndex)
+                    jobPollCount++
+                    val (st, pct) = pollStates[idx]
+                    """
+                    {
+                      "job_id": "job_live_001",
+                      "result_id": "res_live_001",
+                      "status": "$st",
+                      "progress_pct": $pct
+                    }
+                    """.trimIndent()
+                }
+                path.contains("/api/v1/satellite/results/") -> {
+                    """
+                    {
+                      "result_id": "res_live_001",
+                      "job_id": "job_live_001",
+                      "farm_id": "farm_wadi_1",
+                      "owner_uid": "farmer_uid_1",
+                      "scene_id": "S2A_36RTU_20261118_1_L2A",
+                      "crs_epsg": 32636,
+                      "spatial_resolution_m": 10.0,
+                      "statistics": {
+                        "total_pixel_count": 64,
+                        "polygon_pixel_count": 48,
+                        "valid_pixel_count": 44,
+                        "masked_cloud_or_nodata_count": 4,
+                        "valid_pixel_ratio": 0.9167,
+                        "ndvi_mean": 0.68,
+                        "ndvi_std_dev": 0.05,
+                        "ndre_mean": 0.41,
+                        "ndmi_mean": 0.31,
+                        "psri_mean": 0.04,
+                        "anomaly_pixel_count": 6,
+                        "anomaly_area_feddans": 0.14
+                      },
+                      "scientific_assessment": {
+                        "vegetation_stress_detection_ar": "رصد إجهاد نباتي طيفي في 6 بكسل",
+                        "agricultural_risk_assessment_ar": "مؤشر خطر زراعي متوسط",
+                        "confirmed_disease_diagnosis_status_ar": "غير مؤكد من القمر الصناعي وحده"
+                      },
+                      "anomaly_zones_geojson": {"type":"FeatureCollection","features":[]},
+                      "pixel_evaluations": [
+                        {"row": 0, "col": 0, "ndvi": 0.68, "ndre": 0.41, "ndmi": 0.31, "psri": 0.04, "is_anomalous": false, "is_cloud_masked": false}
+                      ]
+                    }
+                    """.trimIndent()
+                }
+                else -> """{"status":"HEALTHY"}"""
+            }
+
+            okhttp3.Response.Builder()
+                .request(req)
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .body(with(okhttp3.ResponseBody) { responseJson.toResponseBody(jsonMediaType) })
+                .build()
+        }
+
+        val okHttp = okhttp3.OkHttpClient.Builder()
+            .addInterceptor(mockInterceptor)
+            .build()
+
+        val repo = com.example.data.RetrofitSatelliteRasterBackendRepository(
+            environment = com.example.data.BackendEnvironment.STAGING,
+            baseUrl = "https://staging-api.agrosight.eg/",
+            okHttpClient = okHttp,
+            tokenProvider = tokenProvider,
+            pollIntervalMs = 1L
+        )
+
+        val progressTransitions = mutableListOf<com.example.data.RasterPipelineExecutionState>()
+        val result = kotlinx.coroutines.runBlocking {
+            repo.runFullGeoreferencedSatelliteAnalysis(
+                farmId = "farm_wadi_1",
+                ownerUid = "farmer_uid_1",
+                cropId = "tomato",
+                growthStageIndex = 2,
+                centerLat = 30.3833,
+                centerLon = 30.3500,
+                areaFeddans = 15f,
+                dateStartIso = "2026-10-01",
+                dateEndIso = "2026-11-20",
+                onProgressUpdate = { state, _, _ ->
+                    progressTransitions.add(state)
+                }
+            )
+        }
+
+        assertTrue("Repository call must succeed after automatic token refresh", result.isSuccess)
+        assertTrue("Token force-refresh must have been triggered on HTTP 401", tokenRefreshRequested)
+        val data = result.getOrThrow()
+        assertEquals("res_live_001", data.resultId)
+        assertEquals("S2A_36RTU_20261118_1_L2A", data.sceneId)
+        assertEquals(32636, data.crsEpsg)
+        assertEquals(44, data.validPixels)
+        assertEquals(0.68f, data.ndviMean, 0.001f)
+        assertTrue(
+            "All 7 polled lifecycle states must be recorded",
+            data.jobStatusHistory.containsAll(
+                listOf(
+                    "QUEUED",
+                    "DISCOVERING_SCENES",
+                    "DOWNLOADING_ASSETS",
+                    "PROCESSING_RASTERS",
+                    "CALCULATING_INDICES",
+                    "GENERATING_OUTPUTS",
+                    "COMPLETED"
+                )
+            )
+        )
+        assertTrue(progressTransitions.contains(com.example.data.RasterPipelineExecutionState.COMPLETED_LIVE_GEOREFERENCED))
+    }
+
+    @Test
+    fun `RetrofitSatelliteRasterBackendRepository handles 401 expiration, 403 unauthorized farm, network interruption, 503 unavailable, and FAILED job`() {
+        val jsonMediaType = with(okhttp3.MediaType) { "application/json".toMediaType() }
+        fun buildRepoForMock(handler: (okhttp3.Request) -> okhttp3.Response): com.example.data.RetrofitSatelliteRasterBackendRepository {
+            val client = okhttp3.OkHttpClient.Builder()
+                .addInterceptor { chain -> handler(chain.request()) }
+                .build()
+            return com.example.data.RetrofitSatelliteRasterBackendRepository(
+                environment = com.example.data.BackendEnvironment.PRODUCTION,
+                baseUrl = "https://api.agrosight.eg/",
+                okHttpClient = client,
+                tokenProvider = com.example.data.FirebaseIdTokenProvider { "still_invalid_token" },
+                pollIntervalMs = 1L
+            )
+        }
+
+        // 1. Persistent HTTP 401 Authentication Expiration
+        val repo401 = buildRepoForMock { req ->
+            okhttp3.Response.Builder()
+                .request(req)
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(401)
+                .message("Unauthorized")
+                .body(
+                    with(okhttp3.ResponseBody) {
+                        """{"detail":{"error_code":"TOKEN_EXPIRED","message":"Expired token"}}"""
+                            .toResponseBody(jsonMediaType)
+                    }
+                )
+                .build()
+        }
+        val res401 = kotlinx.coroutines.runBlocking {
+            repo401.runFullGeoreferencedSatelliteAnalysis("f1", "u1", "tomato", 2, 30.38, 30.35, 10f)
+        }
+        assertTrue(res401.isFailure)
+        val err401 = res401.exceptionOrNull() as com.example.data.SatelliteBackendApiException
+        assertEquals(401, err401.httpStatusCode)
+        assertEquals("TOKEN_EXPIRED", err401.errorCode)
+
+        // 2. HTTP 403 Unauthorized Farm Access
+        val repo403 = buildRepoForMock { req ->
+            okhttp3.Response.Builder()
+                .request(req)
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(403)
+                .message("Forbidden")
+                .body(
+                    with(okhttp3.ResponseBody) {
+                        """{"detail":{"error_code":"FORBIDDEN_FARM_ACCESS","message":"Caller does not own farm"}}"""
+                            .toResponseBody(jsonMediaType)
+                    }
+                )
+                .build()
+        }
+        val res403 = kotlinx.coroutines.runBlocking {
+            repo403.runFullGeoreferencedSatelliteAnalysis("farm_other_user", "u1", "tomato", 2, 30.38, 30.35, 10f)
+        }
+        assertTrue(res403.isFailure)
+        val err403 = res403.exceptionOrNull() as com.example.data.SatelliteBackendApiException
+        assertEquals(403, err403.httpStatusCode)
+        assertEquals("FORBIDDEN_FARM_ACCESS", err403.errorCode)
+
+        // 3. Network Interruption (IOException)
+        val repoNet = buildRepoForMock {
+            throw java.io.IOException("Socket closed mid-transfer")
+        }
+        val resNet = kotlinx.coroutines.runBlocking {
+            repoNet.runFullGeoreferencedSatelliteAnalysis("f1", "u1", "tomato", 2, 30.38, 30.35, 10f)
+        }
+        assertTrue(resNet.isFailure)
+        val errNet = resNet.exceptionOrNull() as com.example.data.SatelliteBackendApiException
+        assertEquals("NETWORK_INTERRUPTED", errNet.errorCode)
+
+        // 4. Backend Unavailable (HTTP 503 FIREBASE_AUTH_NOT_CONFIGURED)
+        val repo503 = buildRepoForMock { req ->
+            okhttp3.Response.Builder()
+                .request(req)
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(503)
+                .message("Service Unavailable")
+                .body(
+                    with(okhttp3.ResponseBody) {
+                        """{"detail":{"error_code":"FIREBASE_AUTH_NOT_CONFIGURED","message":"Missing Firebase Admin credentials"}}"""
+                            .toResponseBody(jsonMediaType)
+                    }
+                )
+                .build()
+        }
+        val res503 = kotlinx.coroutines.runBlocking {
+            repo503.runFullGeoreferencedSatelliteAnalysis("f1", "u1", "tomato", 2, 30.38, 30.35, 10f)
+        }
+        assertTrue(res503.isFailure)
+        val err503 = res503.exceptionOrNull() as com.example.data.SatelliteBackendApiException
+        assertEquals(503, err503.httpStatusCode)
+        assertEquals("FIREBASE_AUTH_NOT_CONFIGURED", err503.errorCode)
+
+        // 5. Processing Failure during Job Execution (status = FAILED)
+        val repoFailedJob = buildRepoForMock { req ->
+            val path = req.url.encodedPath
+            val bodyStr = when {
+                path.endsWith("/api/v1/satellite/scenes") ->
+                    """{"scenes":[{"scene_id":"S2A_TEST","band_assets":{"B04":"https://example.com/B04.tif"}}]}"""
+                path.endsWith("/api/v1/satellite/process") ->
+                    """{"job_id":"job_fail_99","result_id":"res_fail_99","status":"PROCESSING_RASTERS","progress_pct":45}"""
+                else ->
+                    """{"job_id":"job_fail_99","result_id":"res_fail_99","status":"FAILED","error_code":"CORRUPTED_RASTER_TIFF","error_message":"Truncated GeoTIFF tile strip"}"""
+            }
+            okhttp3.Response.Builder()
+                .request(req)
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .body(with(okhttp3.ResponseBody) { bodyStr.toResponseBody(jsonMediaType) })
+                .build()
+        }
+        val resFailedJob = kotlinx.coroutines.runBlocking {
+            repoFailedJob.runFullGeoreferencedSatelliteAnalysis("f1", "u1", "tomato", 2, 30.38, 30.35, 10f)
+        }
+        assertTrue(resFailedJob.isFailure)
+        val errFailedJob = resFailedJob.exceptionOrNull() as com.example.data.SatelliteBackendApiException
+        assertEquals("CORRUPTED_RASTER_TIFF", errFailedJob.errorCode)
+    }
+
+    @Test
+    fun `ChatbotScreen route, grounded Gemini conversation flow, and AgroSight logo Material3 palette are consistent`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val viewModel = buildTestViewModel(app)
+
+        // 1. Verify AgroSight Logo Material3 Theme Palette
+        assertEquals(
+            com.example.ui.theme.AgroSightBotanicalGreen,
+            com.example.ui.theme.AgroSightLogoLightColorScheme.primary
+        )
+        assertEquals(
+            com.example.ui.theme.AgroSightPixelBlue,
+            com.example.ui.theme.AgroSightLogoLightColorScheme.secondary
+        )
+        assertEquals(
+            com.example.ui.theme.AgroSightIvory,
+            com.example.ui.theme.AgroSightLogoLightColorScheme.background
+        )
+        assertEquals(
+            com.example.ui.theme.AgroSightBotanicalSage,
+            com.example.ui.theme.AgroSightLogoLightColorScheme.primaryContainer
+        )
+        assertEquals(
+            androidx.compose.ui.text.style.TextAlign.Right,
+            com.example.ui.theme.Typography.bodyLarge.textAlign
+        )
+        assertEquals(
+            androidx.compose.ui.text.style.TextDirection.Rtl,
+            com.example.ui.theme.Typography.bodyLarge.textDirection
+        )
+
+        // 2. Navigate to AppScreen.CHATBOT and send a farm-grounded query
+        viewModel.selectScreen(AppScreen.CHATBOT)
+        assertEquals(AppScreen.CHATBOT, viewModel.uiState.value.currentScreen)
+
+        val initialCount = viewModel.uiState.value.geminiChatMessages.size
+        viewModel.sendGeminiAgronomyChatMessage("ما المقنن المائي وحالة Sentinel-2 لحقلي اليوم؟", false)
+        val afterSend = viewModel.uiState.value.geminiChatMessages
+        assertTrue("Chatbot history should append user query and grounded assistant reply", afterSend.size >= initialCount + 2)
+        val lastReply = afterSend.last()
+        assertEquals("ASSISTANT", lastReply.role)
+        assertTrue(lastReply.text.contains("إجابة استرشادية للسؤال"))
+        assertTrue(lastReply.isLiveAiGenerated)
+
+        // 3. Clear chat history resets to grounded welcome message
+        viewModel.clearGeminiChatHistory()
+        assertEquals(1, viewModel.uiState.value.geminiChatMessages.size)
+        assertEquals("ASSISTANT", viewModel.uiState.value.geminiChatMessages.first().role)
+    }
+
+    @Test
+    fun `RoomOfflineTelemetryCacheRepository persists weather data and satellite analysis results and serves them when connectivity fails`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val roomDb = androidx.room.Room.inMemoryDatabaseBuilder(
+            app,
+            com.example.data.AgroSightRoomDatabase::class.java
+        )
+            .allowMainThreadQueries()
+            .setQueryExecutor { it.run() }
+            .setTransactionExecutor { it.run() }
+            .build()
+
+        try {
+            val cacheRepo = com.example.data.RoomOfflineTelemetryCacheRepository(
+                roomDb.offlineTelemetryCacheDao()
+            )
+            val dbService = DatabaseService(app)
+            val fakeGemini = FakeAiCopilotDataSource()
+            var isNetworkOnline = true
+
+            val toggleableMeteoSource = object : MeteoForecastDataSource {
+                override suspend fun fetch7DayAgroForecast(
+                    latitude: Double,
+                    longitude: Double,
+                    baseKc: Float
+                ): OpenMeteoResult {
+                    return OpenMeteoClient().buildFallbackForecast(
+                        latitude = latitude,
+                        longitude = longitude,
+                        baseKc = baseKc,
+                        isLive = isNetworkOnline,
+                        httpStatusCode = if (isNetworkOnline) 200 else 0,
+                        errorReasonAr = if (isNetworkOnline) null else "Offline Test Disconnect"
+                    )
+                }
+            }
+
+            val toggleableSatelliteSource = object : SatelliteTelemetryDataSource {
+                override suspend fun fetchLiveOpenSourceSatelliteAndNasaData(
+                    latitude: Double,
+                    longitude: Double
+                ): RealSatelliteAndNasaTelemetry {
+                    return RealSatelliteAndNasaTelemetry(
+                        sceneId = if (isNetworkOnline) "S2A_LIVE_CACHED_SCENE_36RTU" else "DEMO_OFFLINE_FALLBACK",
+                        acquisitionDateIso = "2026-11-18",
+                        constellationAr = "Sentinel-2 L2A",
+                        mgrsTileId = "36RTU",
+                        cloudCoverPct = 1.2f,
+                        platformInstrument = "MSI L2A",
+                        stacCatalogSource = "Element84 STAC",
+                        opticalTileUrl = "https://example.com/tile.png",
+                        retrievedSatelliteBitmap = null,
+                        nasaSolarRadiationMjM2Day = 24.8f,
+                        nasaClearSkyInsolationMjM2Day = 26.5f,
+                        nasaRootZoneSoilMoisturePct = 46.0f,
+                        nasaTemp2mMaxC = 31.5f,
+                        nasaTemp2mMinC = 18.0f,
+                        nasaRelativeHumidityPct = 50.0f,
+                        nasaWindSpeed2mMs = 3.2f,
+                        nasaVaporPressureDeficitKpa = 1.7f,
+                        channels = emptyList(),
+                        stacAcquisitionStatus = if (isNetworkOnline) {
+                            StacAcquisitionStatus.VALID_SCENE_WITH_BAND_ASSETS
+                        } else {
+                            StacAcquisitionStatus.NETWORK_OR_HTTP_FAILURE
+                        },
+                        dataMode = if (isNetworkOnline) {
+                            com.example.data.TelemetryDataMode.LIVE
+                        } else {
+                            com.example.data.TelemetryDataMode.DEMO_ESTIMATED
+                        }
+                    )
+                }
+            }
+
+            val viewModel = AgroSightViewModel(
+                app,
+                AgroSightDependencies(
+                    databaseService = dbService,
+                    openMeteoClient = toggleableMeteoSource,
+                    openSourceSatelliteClient = toggleableSatelliteSource,
+                    satelliteRasterBackendRepository = FakeSatelliteRasterBackendRepository(),
+                    geminiAgroService = fakeGemini,
+                    cloudWorker = AgroSightCloudWorker(dbService, fakeGemini),
+                    firestoreRepository = FakeCloudWorkspaceRepository(),
+                    sqlAuditDao = roomDb.sqlFieldAuditDao(),
+                    offlineTelemetryCacheRepository = cacheRepo
+                )
+            )
+
+            // 1. Online telemetry refresh caches both weather forecast and satellite analysis in Room SQLite
+            val activeFieldId = viewModel.uiState.value.fieldId
+            val activeLat = viewModel.uiState.value.latitude
+            val activeLon = viewModel.uiState.value.longitude
+            val cachedWeather = kotlinx.coroutines.runBlocking {
+                cacheRepo.getCachedWeatherForecast(activeFieldId, activeLat, activeLon)
+            }
+            val cachedSatellite = kotlinx.coroutines.runBlocking {
+                cacheRepo.getCachedSatelliteAnalysis(activeFieldId, activeLat, activeLon)
+            }
+            assertNotNull("Weather forecast must be persisted in Room SQLite", cachedWeather)
+            assertNotNull("Satellite analysis must be persisted in Room SQLite", cachedSatellite)
+            assertEquals("S2B_35RQQ_20260501_0_L2A", cachedSatellite!!.sceneId)
+            assertTrue(cachedWeather!!.wasOriginallyLive)
+            assertTrue(cachedSatellite.wasOriginallyLive)
+
+            // 2. Simulate loss of internet connectivity and refresh telemetry -> falls back to Room SQLite cache
+            isNetworkOnline = false
+            viewModel.restoreTelemetryFromRoomOfflineCache()
+
+            val offlineState = viewModel.uiState.value
+            assertTrue("App should serve telemetry from Room offline cache when offline", offlineState.isServingFromRoomOfflineCache)
+            assertTrue(offlineState.meteoStatusAr.contains("CACHED • Room SQLite"))
+            assertNotNull(offlineState.satelliteAndNasaTelemetry)
+            assertEquals(
+                com.example.data.TelemetryDataMode.CACHED,
+                offlineState.satelliteAndNasaTelemetry?.dataMode
+            )
+            assertNotNull("Georeferenced raster analysis must remain available from Room cache while offline", offlineState.rasterBackendResult)
+            assertEquals("S2B_35RQQ_20260501_0_L2A", offlineState.rasterBackendResult?.sceneId)
+
+            // 3. Clearing offline cache empties Room tables
+            viewModel.clearOfflineTelemetryCache()
+            val afterClearWeather = kotlinx.coroutines.runBlocking {
+                cacheRepo.getCachedWeatherForecast(activeFieldId, activeLat, activeLon)
+            }
+            val afterClearSat = kotlinx.coroutines.runBlocking {
+                cacheRepo.getCachedSatelliteAnalysis(activeFieldId, activeLat, activeLon)
+            }
+            assertEquals(null, afterClearWeather)
+            assertEquals(null, afterClearSat)
+        } finally {
+            roomDb.close()
+        }
+    }
+}
 

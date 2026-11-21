@@ -1,10 +1,3 @@
 <resources>
     <string name="app_name">AgroSight</string>
-    <string name="app_subtitle">منصة جدولة الري الذكي وتحليل التربة والأرصاد بدون حساسات</string>
-    <string name="badge_sentinel">متصل بالقمر الصناعي Sentinel-2</string>
-    <string name="badge_open_meteo">بث حي للأرصاد Open-Meteo</string>
-    <string name="tab_farm_studio">بيانات الأرض والتربة</string>
-    <string name="tab_meteo_et0">الأرصاد والبخر-نتح</string>
-    <string name="tab_satellite_ndvi">خريطة القطاعات (NDVI)</string>
-    <string name="tab_irrigation_schedule">جدولة الري والتسميد</string>
 </resources>

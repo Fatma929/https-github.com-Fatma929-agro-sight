@@ -1,6 +1,7 @@
 package com.example.ui.components
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -12,9 +13,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout. statusBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -52,6 +54,7 @@ import androidx.compose.material3.NavigationDrawerItemDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -62,13 +65,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.example.R
 import com.example.data.FarmerEntity
 import com.example.model.AppScreen
 import com.example.model.formatDecimal1
@@ -76,6 +84,7 @@ import com.example.model.formatDecimal2
 import com.example.model.formatHoursMinutesCompact
 import com.example.ui.theme.AmberLight
 import com.example.ui.theme.CyanLight
+import com.example.ui.theme.EmeraldPrimary
 import com.example.ui.theme.ForestBgDark
 import com.example.ui.theme.ForestBgDeep
 import com.example.ui.theme.ForestCardBorder
@@ -88,6 +97,7 @@ import com.example.ui.theme.MintTextMuted
 import com.example.ui.theme.MintTextPrimary
 import com.example.ui.theme.MintTextSoft
 import com.example.ui.theme.RoseLight
+import com.example.ui.theme.SkyAccent
 import com.example.viewmodel.AgroSightUiState
 
 private fun screenIcon(screen: AppScreen): ImageVector = when (screen) {
@@ -96,6 +106,7 @@ private fun screenIcon(screen: AppScreen): ImageVector = when (screen) {
     AppScreen.IRRIGATION_SCHEDULE -> Icons.Default.CalendarMonth
     AppScreen.SATELLITE_NDVI_MAP -> Icons.Default.SatelliteAlt
     AppScreen.WHATSAPP_BOT -> Icons.AutoMirrored.Filled.Chat
+    AppScreen.CHATBOT -> Icons.Default.AutoAwesome
     AppScreen.AI_DIGITAL_TWIN_HUB -> Icons.Default.AutoAwesome
     AppScreen.FARM_SOIL_STUDIO -> Icons.Default.Landscape
     AppScreen.METEO_ANALYTICS -> Icons.Default.WbSunny
@@ -108,6 +119,7 @@ private fun screenShortLabel(screen: AppScreen): String = when (screen) {
     AppScreen.IRRIGATION_SCHEDULE -> "الري 7 أيام"
     AppScreen.SATELLITE_NDVI_MAP -> "خريطة NDVI"
     AppScreen.WHATSAPP_BOT -> "التنبيهات"
+    AppScreen.CHATBOT -> "شات Gemini"
     AppScreen.AI_DIGITAL_TWIN_HUB -> "مساعد 3D"
     AppScreen.FARM_SOIL_STUDIO -> "الأرض والتربة"
     AppScreen.METEO_ANALYTICS -> "الأرصاد"
@@ -185,6 +197,16 @@ fun AgroSightHeader(
                     )
                 }
 
+                Image(
+                    painter = painterResource(id = R.drawable.img_agrosight_logo),
+                    contentDescription = "شعار أجرو سايت",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .border(1.dp, ForestCardBorder, RoundedCornerShape(10.dp))
+                )
+
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = currentScreen.titleAr,
@@ -196,8 +218,9 @@ fun AgroSightHeader(
                     )
                     Text(
                         text = "$fieldName • $cropNameAr (${areaFeddans.toInt()} فدان)",
-                        color = MintTextSoft,
+                        color = SkyAccent,
                         fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -301,8 +324,8 @@ fun AgroSightHeader(
 }
 
 /**
- * Floating Forest-Green Pill Bottom Navigation Bar with Central Circular Lime-Green `+` Button,
- * matching the reference mockup design (Home | Fields | [ + ] | Alerts | More).
+ * Floating Warm-Ivory & Botanical-Green Pill Bottom Navigation Bar with Central Circular `+` Button,
+ * matching the AgroSight Logo palette (#FCFBF7 Warm Ivory + #1E6744 Botanical Green + #198AC7 Satellite Pixel Blue).
  */
 @Composable
 fun AgroSightBottomBar(
@@ -338,13 +361,14 @@ fun AgroSightBottomBar(
         modifier = Modifier
             .fillMaxWidth()
             .background(ForestBgDeep)
+            .navigationBarsPadding()
             .padding(horizontal = 16.dp, vertical = 10.dp)
     ) {
         Surface(
             shape = RoundedCornerShape(36.dp),
             color = ForestCardDark,
             border = BorderStroke(1.2.dp, ForestCardBorder),
-            shadowElevation = 14.dp,
+            shadowElevation = 10.dp,
             modifier = Modifier.fillMaxWidth()
         ) {
             Row(
@@ -373,17 +397,17 @@ fun AgroSightBottomBar(
                     testTag = "nav_tab_disease_radar"
                 )
 
-                // Slot 3: Central Circular Lime-Green '+' FAB (Matches Reference Mockup)
+                // Slot 3: Central Circular Botanical Green + Satellite Pixel Blue '+' FAB
                 Box(
                     modifier = Modifier
                         .size(54.dp)
                         .clip(CircleShape)
                         .background(
-                            Brush.verticalGradient(
-                                colors = listOf(LimeBright, LimeAccent)
+                            Brush.linearGradient(
+                                colors = listOf(EmeraldPrimary, SkyAccent)
                             )
                         )
-                        .border(2.dp, ForestBgDeep, CircleShape)
+                        .border(2.dp, ForestCardDark, CircleShape)
                         .clickable { showQuickModulesSheet = true }
                         .testTag("bottom_bar_plus_fab"),
                     contentAlignment = Alignment.Center
@@ -391,7 +415,7 @@ fun AgroSightBottomBar(
                     Icon(
                         imageVector = Icons.Default.Add,
                         contentDescription = "إجراء سريع وجميع الأقسام",
-                        tint = ForestBgDeep,
+                        tint = Color.White,
                         modifier = Modifier.size(30.dp)
                     )
                 }
@@ -411,6 +435,7 @@ fun AgroSightBottomBar(
                     icon = Icons.Default.GridView,
                     labelAr = "المزيد",
                     selected = currentScreen in listOf(
+                        AppScreen.CHATBOT,
                         AppScreen.FARM_SOIL_STUDIO,
                         AppScreen.METEO_ANALYTICS,
                         AppScreen.AI_DIGITAL_TWIN_HUB,
@@ -468,6 +493,7 @@ private fun QuickActionsAndModulesDialog(
 ) {
     val allModules = buildList {
         add(AppScreen.HOME)
+        add(AppScreen.CHATBOT)
         add(AppScreen.DISEASE_RADAR)
         add(AppScreen.IRRIGATION_SCHEDULE)
         add(AppScreen.SATELLITE_NDVI_MAP)
@@ -482,6 +508,7 @@ private fun QuickActionsAndModulesDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Card(
             shape = RoundedCornerShape(28.dp),
             colors = CardDefaults.cardColors(containerColor = ForestBgDark),
@@ -666,6 +693,7 @@ private fun QuickActionsAndModulesDialog(
                 }
             }
         }
+        }
     }
 }
 
@@ -689,6 +717,8 @@ fun AgroSightDrawerContent(
             .fillMaxHeight()
             .width(300.dp)
             .background(ForestBgDark)
+            .statusBarsPadding()
+            .navigationBarsPadding()
             .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -727,6 +757,7 @@ fun AgroSightDrawerContent(
 
         val drawerScreens = buildList {
             add(AppScreen.HOME)
+            add(AppScreen.CHATBOT)
             add(AppScreen.DISEASE_RADAR)
             add(AppScreen.IRRIGATION_SCHEDULE)
             add(AppScreen.SATELLITE_NDVI_MAP)

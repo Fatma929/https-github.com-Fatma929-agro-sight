@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import android.graphics.Bitmap
+import androidx.core.net.toUri
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -97,7 +98,9 @@ fun SatelliteMapScreen(
     onOpenScheduleAndSimulator: () -> Unit = {},
     onOpenPrintReport: () -> Unit = {},
     onToggleRealOpticalUnderlay: () -> Unit = {},
-    onRefreshOpenSourceTelemetry: () -> Unit = {}
+    onRefreshOpenSourceTelemetry: () -> Unit = {},
+    onAskGeminiChatbot: (String) -> Unit = {},
+    onOpenWhatsAppChatbot: (String) -> Unit = {}
 ) {
     val sectors = uiState.valveSectors
     val activeSector = sectors.find { it.valveNumber == uiState.selectedValveNumber } ?: sectors.firstOrNull()
@@ -118,6 +121,17 @@ fun SatelliteMapScreen(
                 longitude = uiState.longitude,
                 isSyncing = uiState.isSyncingOpenSourceSatellite,
                 onRefreshTelemetry = onRefreshOpenSourceTelemetry
+            )
+        }
+
+        // Interactive Google Maps Satellite Hybrid + AI Chatbots (Gemini & WhatsApp) Connector Card
+        item {
+            InteractiveGoogleMapsAndChatbotCard(
+                uiState = uiState,
+                activeSector = activeSector,
+                onSelectValve = onSelectValve,
+                onAskGeminiChatbot = onAskGeminiChatbot,
+                onOpenWhatsAppChatbot = onOpenWhatsAppChatbot
             )
         }
 
@@ -281,7 +295,7 @@ fun SatelliteMapScreen(
                                 fontWeight = FontWeight.Bold
                             )
                         }
-                        Column(horizontalAlignment = Alignment.End) {
+                        Column(horizontalAlignment = Alignment.Start) {
                             Text(
                                 text = "متوسط تشغيل المحبس",
                                 style = MaterialTheme.typography.labelMedium,
@@ -932,7 +946,7 @@ private fun ValveScheduleRowCard(
             }
         }
 
-        Column(horizontalAlignment = Alignment.End) {
+        Column(horizontalAlignment = Alignment.Start) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -958,3 +972,166 @@ private fun ValveScheduleRowCard(
         }
     }
 }
+
+@android.annotation.SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun InteractiveGoogleMapsAndChatbotCard(
+    uiState: AgroSightUiState,
+    activeSector: ValveSectorTelemetry?,
+    onSelectValve: (Int) -> Unit,
+    onAskGeminiChatbot: (String) -> Unit,
+    onOpenWhatsAppChatbot: (String) -> Unit
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val googleMapsHtml = androidx.compose.runtime.remember(
+        uiState.latitude,
+        uiState.longitude,
+        uiState.fieldName,
+        uiState.selectedValveNumber,
+        uiState.epidemiologyReport.ndviMean
+    ) {
+        buildInteractiveGoogleMapsLeafletHtml(
+            latitude = uiState.latitude,
+            longitude = uiState.longitude,
+            fieldName = uiState.fieldName,
+            cropNameAr = uiState.selectedCrop.nameAr,
+            selectedValve = uiState.selectedValveNumber,
+            ndviMean = uiState.epidemiologyReport.ndviMean,
+            sectors = uiState.valveSectors
+        )
+    }
+
+    BentoCard(
+        title = "خريطة Google Maps التفاعلية والربط المباشر مع الشات بوت (Gemini & WhatsApp Chatbots)",
+        subtitle = "عرض القمر الصناعي الحي من Google Maps مع مضلعات المحابس الـ 6 واستشارة الشات بوت الذكي بضغطة واحدة",
+        icon = Icons.Default.SatelliteAlt,
+        accentColor = SkyAccent
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(235.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .border(1.dp, SkyAccent.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+        ) {
+            androidx.compose.ui.viewinterop.AndroidView(
+                factory = { ctx ->
+                    android.webkit.WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        webViewClient = android.webkit.WebViewClient()
+                    }
+                },
+                update = { webView ->
+                    webView.loadDataWithBaseURL(
+                        "https://maps.google.com",
+                        googleMapsHtml,
+                        "text/html",
+                        "UTF-8",
+                        null
+                    )
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("satellite_screen_google_maps_webview")
+            )
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            uiState.valveSectors.forEach { sec ->
+                val isSelected = sec.valveNumber == uiState.selectedValveNumber
+                Surface(
+                    color = if (isSelected) Slate900 else Slate100,
+                    shape = RoundedCornerShape(50),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (isSelected) EmeraldLight else Slate200
+                    ),
+                    modifier = Modifier.clickable { onSelectValve(sec.valveNumber) }
+                ) {
+                    Text(
+                        text = "📍 ${sec.nameAr} (NDVI ${formatDecimal2(sec.ndvi)})",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (isSelected) Color.White else Slate900,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        val sectorPrompt = if (activeSector != null) {
+            "حلل لي على خريطة Google Maps (${uiState.latitude}, ${uiState.longitude}) قطاع ${activeSector.nameAr} في ${uiState.fieldName} حيث NDVI=${formatDecimal2(activeSector.ndvi)} وNDWI=${formatDecimal2(activeSector.ndwi)} وزمن الري=${formatDecimal1(activeSector.operatingHours)} ساعة، وما التوصية الفورية؟"
+        } else {
+            "حلل لي خريطة Google Maps (${uiState.latitude}, ${uiState.longitude}) لحقل ${uiState.fieldName} وما توصية الري والتسميد اليوم؟"
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = { onAskGeminiChatbot(sectorPrompt) },
+                colors = ButtonDefaults.buttonColors(containerColor = EmeraldPrimary),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("satellite_ask_gemini_chatbot_btn")
+            ) {
+                Text(
+                    text = "🤖 اسأل شات Gemini الذكي",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Button(
+                onClick = { onOpenWhatsAppChatbot(sectorPrompt) },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF075E54)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("satellite_ask_whatsapp_chatbot_btn")
+            ) {
+                Text(
+                    text = "💬 شات بوت واتساب",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Button(
+            onClick = {
+                try {
+                    val uri = "https://www.google.com/maps/search/?api=1&query=${uiState.latitude},${uiState.longitude}".toUri()
+                    context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, uri))
+                } catch (_: Exception) {
+                }
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("satellite_open_google_maps_app_btn")
+        ) {
+            Text(
+                text = "🗺️ فتح الموقع (${formatCoord4(uiState.latitude)}°N, ${formatCoord4(uiState.longitude)}°E) في تطبيق Google Maps",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+

@@ -42,7 +42,10 @@ jobs:
         run: python3 -m pip install --upgrade pip && python3 -m pip install -r backend/requirements.txt
 
       - name: Run Python Sentinel-2 Raster & FastAPI Backend Unit Tests
-        run: python3 -m unittest discover -s backend -p "test_*.py" -v
+        run: python3 -m unittest discover -s backend -p "test_raster_service.py" -v
+
+      - name: Run Live Sentinel-2 STAC & AWS S3 COG End-to-End Integration Test
+        run: PYTHONPATH=backend python3 backend/test_live_sentinel2_integration.py
 
       - name: Run Android Unit & Robolectric Tests
         run: gradle :app:testDebugUnitTest

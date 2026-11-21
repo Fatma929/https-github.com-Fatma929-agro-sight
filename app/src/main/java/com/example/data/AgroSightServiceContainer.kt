@@ -32,7 +32,8 @@ data class AgroSightDependencies(
     val cloudWorker: AgroSightCloudWorker,
     val firestoreRepository: CloudWorkspaceRepository,
     val sqlAuditDao: SqlFieldAuditDao,
-    val satelliteRasterBackendRepository: SatelliteRasterBackendRepository = RetrofitSatelliteRasterBackendRepository()
+    val satelliteRasterBackendRepository: SatelliteRasterBackendRepository = RetrofitSatelliteRasterBackendRepository(),
+    val offlineTelemetryCacheRepository: OfflineTelemetryCacheDataSource = InMemoryOfflineTelemetryCacheRepository()
 ) {
     companion object {
         fun createDefault(context: Context): AgroSightDependencies {
@@ -46,7 +47,9 @@ data class AgroSightDependencies(
                 geminiAgroService = gemini
             )
             val firestoreRepo = AgroSightFirestoreRepository(appContext)
-            val roomDao = AgroSightRoomDatabase.getInstance(appContext).sqlFieldAuditDao()
+            val roomDb = AgroSightRoomDatabase.getInstance(appContext)
+            val roomDao = roomDb.sqlFieldAuditDao()
+            val offlineCacheRepo = RoomOfflineTelemetryCacheRepository(roomDb.offlineTelemetryCacheDao())
             val rasterBackendRepo = RetrofitSatelliteRasterBackendRepository()
             return AgroSightDependencies(
                 databaseService = dbService,
@@ -56,7 +59,8 @@ data class AgroSightDependencies(
                 cloudWorker = worker,
                 firestoreRepository = firestoreRepo,
                 sqlAuditDao = roomDao,
-                satelliteRasterBackendRepository = rasterBackendRepo
+                satelliteRasterBackendRepository = rasterBackendRepo,
+                offlineTelemetryCacheRepository = offlineCacheRepo
             )
         }
     }

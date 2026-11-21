@@ -1442,6 +1442,8 @@ class GeoTiffCogProcessor:
 
         grid: List[List[float]] = [[float("nan") for _ in range(win_w)] for _ in range(win_h)]
 
+        predictor = int(target_tags.get(317, primary_tags.get(317, 1)))
+
         def _decompress_block(raw_chunk: bytes) -> bytes:
             if compression in (8, 32946):
                 try:
@@ -1451,6 +1453,26 @@ class GeoTiffCogProcessor:
             if compression == 1:
                 return raw_chunk
             raise RasterIntegrityError(f"Unsupported TIFF compression method: {compression}")
+
+        def _unpack_block_values(chunk: bytes, block_width: int, block_height: int) -> Tuple[float, ...]:
+            total_vals = block_width * block_height
+            raw_vals = list(struct.unpack(f"{endian}{total_vals}{px_fmt}", chunk[: total_vals * px_bytes]))
+            if predictor == 2 and px_fmt in ("B", "H", "h", "I", "i"):
+                modulus = 256 if px_bytes == 1 else (65536 if px_bytes == 2 else 4294967296)
+                is_signed = px_fmt in ("h", "i")
+                half_mod = modulus // 2
+                for row_idx in range(block_height):
+                    row_base = row_idx * block_width
+                    acc = int(raw_vals[row_base]) % modulus
+                    if is_signed and acc >= half_mod:
+                        acc -= modulus
+                    raw_vals[row_base] = acc
+                    for col_idx in range(1, block_width):
+                        acc = (acc + int(raw_vals[row_base + col_idx])) % modulus
+                        if is_signed and acc >= half_mod:
+                            acc -= modulus
+                        raw_vals[row_base + col_idx] = acc
+            return tuple(float(v) for v in raw_vals)
 
         if cls.TAG_TILE_OFFSETS in target_tags:
             tile_w = int(target_tags.get(cls.TAG_TILE_WIDTH, 0))
@@ -1501,7 +1523,7 @@ class GeoTiffCogProcessor:
                         raise RasterIntegrityError(
                             f"Decompressed tile {tile_idx} has {len(chunk)} bytes, expected {expected_tile_bytes}"
                         )
-                    unpacked = struct.unpack(f"{endian}{tile_vals}{px_fmt}", chunk[:expected_tile_bytes])
+                    unpacked = _unpack_block_values(chunk, tile_w, tile_h)
 
                     tile_row_origin = ty * tile_h
                     tile_col_origin = tx * tile_w
@@ -1559,7 +1581,7 @@ class GeoTiffCogProcessor:
                     raise RasterIntegrityError(
                         f"Decompressed strip {strip_idx} has {len(chunk)} bytes, expected {expected_vals * px_bytes}"
                     )
-                unpacked = struct.unpack(f"{endian}{expected_vals}{px_fmt}", chunk[: expected_vals * px_bytes])
+                unpacked = _unpack_block_values(chunk, width, rows_in_this_strip)
 
                 ov_r_start = max(r_min, strip_r_start)
                 ov_r_end = min(r_max, strip_r_end)
@@ -2545,12 +2567,14 @@ def search_stac_sentinel2_scenes(
     farm_polygon_geojson: Dict[str, Any],
     max_cloud_cover: float = 35.0,
     limit: int = 5,
+    date_start_iso: Optional[str] = None,
+    date_end_iso: Optional[str] = None,
     stac_endpoint: str = "https://earth-search.aws.element84.com/v1/search",
 ) -> Dict[str, Any]:
     """
     Query Element84 Earth Search STAC API (`sentinel-2-l2a`) using the actual farm GeoJSON polygon
-    geometry (`intersects`) and extract actual COG spectral band assets (`B02`, `B04`, `B05`,
-    `B06`, `B08`, `B8A`, `B11`, `SCL`).
+    geometry (`intersects`), configurable date range (`datetime`), and cloud-cover filter,
+    extracting actual COG spectral band assets (`B02`, `B04`, `B05`, `B06`, `B08`, `B8A`, `B11`, `SCL`).
     """
     geom = (
         farm_polygon_geojson.get("geometry")
@@ -2560,12 +2584,16 @@ def search_stac_sentinel2_scenes(
     if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
         raise ValueError("Invalid farm GeoJSON geometry: must be a Polygon or MultiPolygon")
 
-    payload = {
+    payload: Dict[str, Any] = {
         "collections": ["sentinel-2-l2a"],
         "intersects": geom,
         "limit": max(1, min(20, int(limit))),
         "query": {"eo:cloud_cover": {"lte": float(max_cloud_cover)}},
     }
+    if date_start_iso or date_end_iso:
+        start_str = f"{str(date_start_iso).strip()}T00:00:00Z" if date_start_iso and "T" not in str(date_start_iso) else (str(date_start_iso or "..").strip())
+        end_str = f"{str(date_end_iso).strip()}T23:59:59Z" if date_end_iso and "T" not in str(date_end_iso) else (str(date_end_iso or "..").strip())
+        payload["datetime"] = f"{start_str}/{end_str}"
 
     req = urllib.request.Request(
         stac_endpoint,

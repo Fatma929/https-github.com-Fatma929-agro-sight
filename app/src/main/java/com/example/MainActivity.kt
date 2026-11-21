@@ -1,5 +1,8 @@
 package com.example
 
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -22,10 +25,13 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.model.AppScreen
@@ -35,6 +41,7 @@ import com.example.ui.components.AgroSightHeader
 import com.example.ui.components.ExecutiveCommandBar
 import com.example.ui.screens.AdminPortalScreen
 import com.example.ui.screens.AiDigitalTwinHubScreen
+import com.example.ui.screens.ChatbotScreen
 import com.example.ui.screens.FarmSoilStudioScreen
 import com.example.ui.screens.FarmerWhatsAppAuthDialog
 import com.example.ui.screens.HomeDashboardScreen
@@ -50,11 +57,51 @@ import com.example.ui.theme.ForestBgDark
 import com.example.ui.theme.Slate50
 import com.example.ui.theme.Slate900
 import com.example.viewmodel.AgroSightViewModel
+import com.google.firebase.Firebase
+import com.google.firebase.appcheck.appCheck
+import com.google.firebase.appcheck.debug.DebugAppCheckProviderFactory
+import com.google.firebase.appcheck.recaptcha.RecaptchaAppCheckProviderFactory
 import kotlinx.coroutines.launch
+
+private const val APP_CHECK_PREFS = "com.google.firebase.appcheck.debug.store"
+private const val KEY_DEBUG_TOKEN =
+    "com.google.firebase.appcheck.debug.irable.FD2837F7-5241-4A1E-9843-17F9E50208D0"
+private const val EXTRA_DEBUG_TOKEN = "FIREBASE_APPCHECK_DEBUG_TOKEN"
+
+@SuppressLint("ApplySharedPref", "UseKtx")
+fun configureAppCheck(context: Context, intent: Intent?) {
+    try {
+        if (BuildConfig.DEBUG) {
+            val token = intent?.getStringExtra(EXTRA_DEBUG_TOKEN)
+            if (!token.isNullOrEmpty()) {
+                // Must use .commit() (synchronous) so token is written before installAppCheckProviderFactory reads it
+                context.getSharedPreferences(APP_CHECK_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_DEBUG_TOKEN, token)
+                    .commit()
+            }
+            Firebase.appCheck.installAppCheckProviderFactory(
+                DebugAppCheckProviderFactory.getInstance()
+            )
+        } else {
+            val siteKey = context.getString(R.string.recaptcha_site_key)
+            if (siteKey.isNotBlank()) {
+                Firebase.appCheck.installAppCheckProviderFactory(
+                    RecaptchaAppCheckProviderFactory.getInstance(siteKey)
+                )
+            }
+        }
+    } catch (_: Exception) {
+        // Safe fallback in unit/Robolectric environments when FirebaseApp isn't initialized yet
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        java.util.Locale.setDefault(java.util.Locale.forLanguageTag("ar-EG"))
+        window.decorView.layoutDirection = android.view.View.LAYOUT_DIRECTION_RTL
+        configureAppCheck(this, intent)
         enableEdgeToEdge()
         setContent {
             AgroSightTheme {
@@ -66,12 +113,24 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun AgroSightApp(
-    viewModel: AgroSightViewModel = viewModel()
+    viewModel: AgroSightViewModel = run {
+        val context = androidx.compose.ui.platform.LocalContext.current
+        val application = context.applicationContext as android.app.Application
+        viewModel(
+            factory = object : androidx.lifecycle.ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+                    return AgroSightViewModel(application) as T
+                }
+            }
+        )
+    }
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
     BackHandler(
         enabled = uiState.isAuthModalVisible ||
             uiState.isDatabaseSchemaModalVisible ||
@@ -120,8 +179,8 @@ fun AgroSightApp(
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet(
-                drawerContainerColor = ForestBgDark,
-                drawerContentColor = Color.White
+                drawerContainerColor = androidx.compose.material3.MaterialTheme.colorScheme.background,
+                drawerContentColor = androidx.compose.material3.MaterialTheme.colorScheme.onBackground
             ) {
                 AgroSightDrawerContent(
                     currentScreen = uiState.currentScreen,
@@ -142,7 +201,7 @@ fun AgroSightApp(
     ) {
         Scaffold(
             modifier = Modifier.fillMaxSize(),
-            containerColor = if (uiState.currentScreen == AppScreen.HOME) ForestBgDark else Slate50,
+            containerColor = androidx.compose.material3.MaterialTheme.colorScheme.background,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
                 AgroSightHeader(
@@ -209,7 +268,34 @@ fun AgroSightApp(
                                 onSelectField = viewModel::selectFieldById,
                                 onOpenAuthModal = { viewModel.setAuthModalVisible(true) },
                                 onSendMorningWhatsAppReport = viewModel::sendMorningIrrigationAndAcidWhatsAppAlert,
-                                onRefreshTelemetry = viewModel::refreshOpenMeteoTelemetry
+                                onRefreshTelemetry = viewModel::refreshOpenMeteoTelemetry,
+                                onSelectSatelliteLayer = viewModel::selectSatelliteLayer,
+                                onSelectValveSector = viewModel::selectValveSector,
+                                onAskGeminiAboutSector = { prompt ->
+                                    viewModel.selectScreen(AppScreen.CHATBOT)
+                                    viewModel.sendGeminiAgronomyChatMessage(prompt, false)
+                                },
+                                onCacheCurrentTelemetryToRoom = viewModel::cacheCurrentTelemetryToRoomForOffline,
+                                onRestoreTelemetryFromRoomCache = viewModel::restoreTelemetryFromRoomOfflineCache,
+                                onClearOfflineTelemetryCache = viewModel::clearOfflineTelemetryCache
+                            )
+                        }
+
+                        AppScreen.CHATBOT -> {
+                            ChatbotScreen(
+                                uiState = uiState,
+                                onSendMessage = { msg ->
+                                    viewModel.sendGeminiAgronomyChatMessage(msg, false)
+                                },
+                                onToggleSearchGrounding = viewModel::toggleGoogleSearchGrounding,
+                                onToggleMapsGrounding = viewModel::toggleGoogleMapsGrounding,
+                                onSelectField = viewModel::selectFieldById,
+                                onSelectValveSector = viewModel::selectValveSector,
+                                onClearChatHistory = viewModel::clearGeminiChatHistory,
+                                onNavigateToScreen = viewModel::selectScreen,
+                                onOpenWhatsAppWithMessage = { phone, msg ->
+                                    viewModel.openDirectWhatsAppWaMeLink(phone, msg, logNewRecord = true)
+                                }
                             )
                         }
 
@@ -281,7 +367,15 @@ fun AgroSightApp(
                                     viewModel.setPrintReportModalVisible(true)
                                 },
                                 onToggleRealOpticalUnderlay = viewModel::toggleRealOpticalSatelliteUnderlay,
-                                onRefreshOpenSourceTelemetry = viewModel::refreshOpenMeteoTelemetry
+                                onRefreshOpenSourceTelemetry = viewModel::refreshOpenMeteoTelemetry,
+                                onAskGeminiChatbot = { prompt ->
+                                    viewModel.selectScreen(AppScreen.CHATBOT)
+                                    viewModel.sendGeminiAgronomyChatMessage(prompt, false)
+                                },
+                                onOpenWhatsAppChatbot = { prompt ->
+                                    viewModel.selectScreen(AppScreen.WHATSAPP_BOT)
+                                    viewModel.sendFarmerWhatsAppQuestion(prompt)
+                                }
                             )
                         }
 
@@ -349,5 +443,6 @@ fun AgroSightApp(
                 }
             }
         }
+    }
     }
 }

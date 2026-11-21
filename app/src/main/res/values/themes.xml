@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.MyApplication" parent="android:Theme.DeviceDefault.NoActionBar" />
+    <style name="Theme.MyApplication" parent="android:Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowBackground">@color/agrosight_ivory_bg</item>
+        <item name="android:colorPrimary">@color/agrosight_primary_green</item>
+        <item name="android:colorPrimaryDark">@color/agrosight_primary_green_dark</item>
+        <item name="android:colorAccent">@color/agrosight_secondary_blue</item>
+        <item name="android:layoutDirection">rtl</item>
+        <item name="android:textDirection">rtl</item>
+        <item name="android:textAlignment">viewStart</item>
+    </style>
 </resources>

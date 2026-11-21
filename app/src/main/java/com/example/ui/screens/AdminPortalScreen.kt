@@ -22,13 +22,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Launch
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Launch
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.PersonAdd
@@ -529,7 +529,7 @@ private fun AdminExecutiveAnalyticsSection(
                             colors = ButtonDefaults.buttonColors(containerColor = SkyAccent),
                             modifier = Modifier.height(36.dp)
                         ) {
-                            Icon(Icons.Default.Launch, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Icon(Icons.AutoMirrored.Filled.Launch, contentDescription = null, modifier = Modifier.size(14.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("فتح لوحة المستخدم", style = MaterialTheme.typography.labelSmall)
                         }

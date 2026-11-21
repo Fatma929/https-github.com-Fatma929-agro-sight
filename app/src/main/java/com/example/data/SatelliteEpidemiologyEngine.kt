@@ -1,5 +1,8 @@
+@file:SuppressLint("NewApi")
+
 package com.example.data
 
+import android.annotation.SuppressLint
 import com.example.model.formatDecimal1
 import com.example.model.formatDecimal2
 import java.time.LocalDate

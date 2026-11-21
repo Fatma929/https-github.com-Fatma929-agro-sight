@@ -33,6 +33,10 @@ enum class AppScreen(val titleAr: String, val subtitleAr: String) {
         "بوت واتساب الاستباقي والإنذار المبكر",
         "روابط واتساب المباشرة (wa.me) وتوثيق السجل ومحادثة Gemini AI"
     ),
+    CHATBOT(
+        "شات المستشار الزراعي الذكي (Gemini Agronomy Chatbot)",
+        "واجهة محادثة ذكية مربوطة ببيانات حقلك، أقمار Sentinel-2، نماذج FAO-56، وخرائط Google Maps"
+    ),
     AI_DIGITAL_TWIN_HUB(
         "المساعد الصوتي والتوأم الرقمي 3D والسحابة",
         "محادثة Gemini الصوتية وبحث Google وخرائط Maps ومشهد Three.js 3D وقاعدة بيانات Firestore & SQL"

@@ -1,5 +1,8 @@
+@file:SuppressLint("NewApi")
+
 package com.example.data
 
+import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import com.example.model.CropSpec

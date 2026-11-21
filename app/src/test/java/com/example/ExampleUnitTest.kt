@@ -23,6 +23,8 @@ import com.example.model.UserRole
 import com.example.model.WhatIfSimulatorInput
 import com.example.model.buildWeeklyIrrigationSchedule
 import com.example.model.computeWaterSavingsAnalytics
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -496,5 +498,57 @@ class ExampleUnitTest {
         assertEquals("", gmailUser.whatsappPhone)
         assertEquals("", gmailUser.nationalId)
     }
+
+    @Test
+    fun `BackendEnvironment enforces HTTPS in STAGING and PRODUCTION and supports emulator and device environments`() {
+        val emulatorUrl = com.example.data.BackendEnvironment.resolveBaseUrl(
+            com.example.data.BackendEnvironment.LOCAL_EMULATOR,
+            "http://10.0.2.2:8090"
+        )
+        assertEquals("http://10.0.2.2:8090/", emulatorUrl)
+
+        val deviceUrl = com.example.data.BackendEnvironment.resolveBaseUrl(
+            com.example.data.BackendEnvironment.PHYSICAL_DEVICE,
+            "http://192.168.1.45:8090/"
+        )
+        assertEquals("http://192.168.1.45:8090/", deviceUrl)
+
+        val stagingHttps = com.example.data.BackendEnvironment.resolveBaseUrl(
+            com.example.data.BackendEnvironment.STAGING,
+            "https://staging-api.agrosight.eg"
+        )
+        assertEquals("https://staging-api.agrosight.eg/", stagingHttps)
+
+        val prodHttps = com.example.data.BackendEnvironment.resolveBaseUrl(
+            com.example.data.BackendEnvironment.PRODUCTION,
+            "https://api.agrosight.eg/"
+        )
+        assertEquals("https://api.agrosight.eg/", prodHttps)
+
+        // Plain HTTP in STAGING or PRODUCTION must throw IllegalArgumentException
+        var stagingHttpRejected = false
+        try {
+            com.example.data.BackendEnvironment.resolveBaseUrl(
+                com.example.data.BackendEnvironment.STAGING,
+                "http://staging-api.agrosight.eg/"
+            )
+        } catch (_: IllegalArgumentException) {
+            stagingHttpRejected = true
+        }
+        assertTrue("STAGING must reject plain HTTP URLs", stagingHttpRejected)
+
+        var prodHttpRejected = false
+        try {
+            com.example.data.BackendEnvironment.resolveBaseUrl(
+                com.example.data.BackendEnvironment.PRODUCTION,
+                "http://api.agrosight.eg/"
+            )
+        } catch (_: IllegalArgumentException) {
+            prodHttpRejected = true
+        }
+        assertTrue("PRODUCTION must reject plain HTTP URLs", prodHttpRejected)
+    }
 }
+
+
 

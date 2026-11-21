@@ -4,8 +4,8 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -14,27 +14,19 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CalendarMonth
-import androidx.compose.material.icons.filled.Chat
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Science
-import androidx.compose.material.icons.filled.WaterDrop
 import androidx.compose.material.icons.filled.WbSunny
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -47,41 +39,25 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.example.R
 import com.example.data.AnomalyPattern
 import com.example.model.AppScreen
 import com.example.model.formatDecimal1
 import com.example.model.formatDecimal2
 import com.example.model.formatHoursMinutesCompact
-import com.example.ui.theme.AmberLight
 import com.example.ui.theme.AmberWarning
-import com.example.ui.theme.CyanLight
-import com.example.ui.theme.EmeraldDark
-import com.example.ui.theme.EmeraldLight
-import com.example.ui.theme.EmeraldPrimary
 import com.example.ui.theme.RoseDanger
-import com.example.ui.theme.RoseLight
-import com.example.ui.theme.SkyAccent
-import com.example.ui.theme.Slate400
-import com.example.ui.theme.Slate700
-import com.example.ui.theme.Slate800
-import com.example.ui.theme.Slate900
-import com.example.ui.theme.Slate950
 import com.example.viewmodel.AgroSightUiState
 import kotlin.math.roundToInt
 
 /**
  * Flagship Executive Telemetry & Orbital Health Hero Strip:
- * Combines an animated radial Crop Health & Yield Potential Score Gauge, real-time Sentinel-2
- * & Open-Meteo metrics, and one-tap navigation pills to all 6 core modules.
+ * Styled with MaterialTheme.colorScheme using the AgroSight logo's
+ * Primary Botanical Green (#1E6744), Secondary Satellite Pixel Blue (#198AC7),
+ * Soft Botanical Sage (#D3E7E0), and Warm Ivory (#FCFBF7).
  */
 @Composable
 fun ExecutiveCommandBar(
@@ -90,6 +66,7 @@ fun ExecutiveCommandBar(
     onOpenPrintReport: () -> Unit,
     onSendInstantWhatsAppReport: () -> Unit
 ) {
+    val scheme = MaterialTheme.colorScheme
     val report = uiState.epidemiologyReport
     val audit = uiState.formulaAudit
 
@@ -106,9 +83,9 @@ fun ExecutiveCommandBar(
 
     val healthColor by animateColorAsState(
         targetValue = when {
-            compositeHealthScore >= 82 -> EmeraldLight
-            compositeHealthScore >= 68 -> AmberLight
-            else -> RoseLight
+            compositeHealthScore >= 82 -> scheme.primary
+            compositeHealthScore >= 68 -> AmberWarning
+            else -> RoseDanger
         },
         animationSpec = tween(500),
         label = "healthColor"
@@ -125,14 +102,17 @@ fun ExecutiveCommandBar(
             .fillMaxWidth()
             .background(
                 Brush.verticalGradient(
-                    colors = listOf(Slate900, Slate950)
+                    colors = listOf(
+                        scheme.background,
+                        scheme.surfaceVariant.copy(alpha = 0.55f)
+                    )
                 )
             )
             .padding(horizontal = 14.dp, vertical = 10.dp)
             .testTag("executive_command_bar"),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // Top Glassmorphic Telemetry Summary Card
+        // Top Telemetry Summary Card using AgroSight Logo Primary Green & Secondary Pixel Blue
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -140,8 +120,9 @@ fun ExecutiveCommandBar(
                 .background(
                     Brush.horizontalGradient(
                         colors = listOf(
-                            Slate800.copy(alpha = 0.95f),
-                            Slate900.copy(alpha = 0.98f)
+                            scheme.primaryContainer.copy(alpha = 0.55f),
+                            scheme.surface,
+                            scheme.secondaryContainer.copy(alpha = 0.55f)
                         )
                     )
                 )
@@ -149,8 +130,8 @@ fun ExecutiveCommandBar(
                     width = 1.dp,
                     brush = Brush.horizontalGradient(
                         colors = listOf(
-                            EmeraldLight.copy(alpha = 0.55f),
-                            CyanLight.copy(alpha = 0.35f)
+                            scheme.primary.copy(alpha = 0.45f),
+                            scheme.secondary.copy(alpha = 0.45f)
                         )
                     ),
                     shape = RoundedCornerShape(18.dp)
@@ -167,7 +148,7 @@ fun ExecutiveCommandBar(
                 Canvas(modifier = Modifier.size(60.dp)) {
                     val strokeW = 6.dp.toPx()
                     drawArc(
-                        color = Slate700.copy(alpha = 0.55f),
+                        color = scheme.outline.copy(alpha = 0.45f),
                         startAngle = 135f,
                         sweepAngle = 270f,
                         useCenter = false,
@@ -175,7 +156,7 @@ fun ExecutiveCommandBar(
                     )
                     drawArc(
                         brush = Brush.sweepGradient(
-                            colors = listOf(healthColor, CyanLight, healthColor)
+                            colors = listOf(healthColor, scheme.secondary, healthColor)
                         ),
                         startAngle = 135f,
                         sweepAngle = 270f * animatedProgress,
@@ -187,13 +168,14 @@ fun ExecutiveCommandBar(
                     Text(
                         text = "$compositeHealthScore%",
                         style = MaterialTheme.typography.titleSmall,
-                        color = Color.White,
+                        color = scheme.onSurface,
                         fontWeight = FontWeight.ExtraBold
                     )
                     Text(
                         text = "صحة الحقل",
                         style = MaterialTheme.typography.labelSmall,
-                        color = healthColor
+                        color = healthColor,
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
@@ -211,17 +193,17 @@ fun ExecutiveCommandBar(
                     Text(
                         text = "${uiState.fieldName} (${uiState.selectedCrop.nameAr})",
                         style = MaterialTheme.typography.labelLarge,
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold,
+                        color = scheme.onSurface,
+                        fontWeight = FontWeight.ExtraBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
 
                     Surface(
-                        color = healthColor.copy(alpha = 0.16f),
+                        color = healthColor.copy(alpha = 0.14f),
                         shape = RoundedCornerShape(50),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, healthColor.copy(alpha = 0.6f))
+                        border = BorderStroke(1.dp, healthColor.copy(alpha = 0.5f))
                     ) {
                         Text(
                             text = if (report.anomalyPattern == AnomalyPattern.HEALTHY) "🟢 سليم طيفياً" else "⚠️ ${report.detectedRiskNameAr.take(18)}",
@@ -242,31 +224,31 @@ fun ExecutiveCommandBar(
                         modifier = Modifier.weight(1f),
                         label = "مقنن اليوم",
                         value = "${formatDecimal1(audit.grossWaterM3PerFeddanDay)} م³",
-                        accent = EmeraldLight
+                        accent = scheme.primary
                     )
                     ExecutiveMicroKpi(
                         modifier = Modifier.weight(1f),
                         label = "تشغيل المحبس",
                         value = formatHoursMinutesCompact(audit.valveOperatingHoursPerSector),
-                        accent = CyanLight
+                        accent = scheme.secondary
                     )
                     ExecutiveMicroKpi(
                         modifier = Modifier.weight(1f),
                         label = "البخر ET₀",
                         value = "${formatDecimal2(audit.openMeteoEt0MmDay)} مم",
-                        accent = AmberLight
+                        accent = AmberWarning
                     )
                     ExecutiveMicroKpi(
                         modifier = Modifier.weight(1f),
                         label = "الغطاء NDVI",
                         value = formatDecimal2(audit.meanSentinelNdvi),
-                        accent = EmeraldLight
+                        accent = scheme.primary
                     )
                 }
             }
         }
 
-        // Scrollable 6-Module Ribbon so ALL 6 screens + Instant WhatsApp & PDF are 1 tap away
+        // Scrollable Module Ribbon so all core screens + Instant WhatsApp & PDF are 1 tap away
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -275,22 +257,23 @@ fun ExecutiveCommandBar(
             verticalAlignment = Alignment.CenterVertically
         ) {
             val allModules = listOf(
+                Triple(AppScreen.CHATBOT, "🤖 شات المستشار Gemini", Icons.Default.AutoAwesome),
                 Triple(AppScreen.DISEASE_RADAR, "🛰️ رادار الأمراض", Icons.Default.Radar),
                 Triple(AppScreen.SATELLITE_NDVI_MAP, "🗺️ خريطة القطاعات NDVI", Icons.Default.Public),
                 Triple(AppScreen.IRRIGATION_SCHEDULE, "⏱️ جدول المحابس والمحاكي", Icons.Default.CalendarMonth),
                 Triple(AppScreen.METEO_ANALYTICS, "☀️ الأرصاد و FAO-56", Icons.Default.WbSunny),
                 Triple(AppScreen.FARM_SOIL_STUDIO, "🧪 مختبر التربة و pH", Icons.Default.Science),
-                Triple(AppScreen.WHATSAPP_BOT, "💬 بوت واتساب و Worker", Icons.Default.Chat)
+                Triple(AppScreen.WHATSAPP_BOT, "💬 بوت واتساب و Worker", Icons.AutoMirrored.Filled.Chat)
             )
 
             allModules.forEach { (screen, label, _) ->
                 val isSelected = uiState.currentScreen == screen
                 Surface(
-                    color = if (isSelected) EmeraldPrimary else Slate800.copy(alpha = 0.85f),
+                    color = if (isSelected) scheme.primary else scheme.surface,
                     shape = RoundedCornerShape(50),
-                    border = androidx.compose.foundation.BorderStroke(
+                    border = BorderStroke(
                         width = if (isSelected) 1.5.dp else 1.dp,
-                        color = if (isSelected) EmeraldLight else Slate700
+                        color = if (isSelected) scheme.primary else scheme.outline
                     ),
                     modifier = Modifier
                         .clickable { onSelectScreen(screen) }
@@ -299,8 +282,8 @@ fun ExecutiveCommandBar(
                     Text(
                         text = label,
                         style = MaterialTheme.typography.labelMedium,
-                        color = if (isSelected) Color.White else Slate400,
-                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                        color = if (isSelected) scheme.onPrimary else scheme.onSurface,
+                        fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
                     )
                 }
@@ -308,9 +291,9 @@ fun ExecutiveCommandBar(
 
             // Quick Action Pill: Instant Morning Broadcast to WhatsApp
             Surface(
-                color = Color(0xFF075E54),
+                color = scheme.primaryContainer,
                 shape = RoundedCornerShape(50),
-                border = androidx.compose.foundation.BorderStroke(1.dp, EmeraldLight),
+                border = BorderStroke(1.dp, scheme.primary),
                 modifier = Modifier
                     .clickable { onSendInstantWhatsAppReport() }
                     .testTag("ribbon_instant_whatsapp_btn")
@@ -318,17 +301,17 @@ fun ExecutiveCommandBar(
                 Text(
                     text = "📲 إرسال نشرة الواتساب",
                     style = MaterialTheme.typography.labelMedium,
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
+                    color = scheme.onPrimaryContainer,
+                    fontWeight = FontWeight.ExtraBold,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
                 )
             }
 
             // Quick Action Pill: Open PDF Print Report
             Surface(
-                color = SkyAccent.copy(alpha = 0.25f),
+                color = scheme.secondaryContainer,
                 shape = RoundedCornerShape(50),
-                border = androidx.compose.foundation.BorderStroke(1.dp, CyanLight),
+                border = BorderStroke(1.dp, scheme.secondary),
                 modifier = Modifier
                     .clickable { onOpenPrintReport() }
                     .testTag("ribbon_instant_pdf_btn")
@@ -336,8 +319,8 @@ fun ExecutiveCommandBar(
                 Text(
                     text = "🖨️ طباعة التقرير PDF",
                     style = MaterialTheme.typography.labelMedium,
-                    color = CyanLight,
-                    fontWeight = FontWeight.Bold,
+                    color = scheme.secondary,
+                    fontWeight = FontWeight.ExtraBold,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
                 )
             }
@@ -352,25 +335,26 @@ private fun ExecutiveMicroKpi(
     value: String,
     accent: Color
 ) {
+    val scheme = MaterialTheme.colorScheme
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(10.dp))
-            .background(Slate950.copy(alpha = 0.7f))
-            .border(1.dp, Slate700.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+            .background(scheme.surface)
+            .border(1.dp, scheme.outline.copy(alpha = 0.7f), RoundedCornerShape(10.dp))
             .padding(vertical = 5.dp, horizontal = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
-            color = Slate400,
+            color = scheme.onSurfaceVariant,
             maxLines = 1
         )
         Text(
             text = value,
             style = MaterialTheme.typography.labelMedium,
             color = accent,
-            fontWeight = FontWeight.Bold,
+            fontWeight = FontWeight.ExtraBold,
             maxLines = 1
         )
     }

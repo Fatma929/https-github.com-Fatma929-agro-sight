@@ -1,8 +1,11 @@
+@file:SuppressLint("NewApi")
+
 package com.example.viewmodel
 
+import android.annotation.SuppressLint
 import android.app.Application
 import android.content.Intent
-import android.net.Uri
+import androidx.core.net.toUri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.AgroAiCopilotDataSource
@@ -12,11 +15,15 @@ import com.example.data.AgroSightFirestoreRepository
 import com.example.data.AgroSightRoomDatabase
 import com.example.data.AnomalyPattern
 import com.example.data.AuthLoginChannel
+import com.example.data.CachedSatelliteAnalysisEntity
+import com.example.data.CachedWeatherForecastEntity
 import com.example.data.CloudChatLog
 import com.example.data.CloudWorkspaceRepository
 import com.example.data.DailyDispatchBatchSummary
 import com.example.data.DatabaseService
 import com.example.data.MeteoForecastDataSource
+import com.example.data.OfflineTelemetryCacheDataSource
+import com.example.data.OfflineTelemetryCacheSerializer
 import com.example.data.RecalculateAgronomicDerivedStateUseCase
 import com.example.data.SatelliteTelemetryDataSource
 import com.example.data.EpidemiologyDiagnosisReport
@@ -36,6 +43,7 @@ import com.example.data.SatelliteRasterBackendRepository
 import com.example.data.ScientificFormulaCalculationAudit
 import com.example.data.SpectralRadarLayer
 import com.example.data.SqlFieldAuditEntity
+import com.example.data.TelemetryDataMode
 import com.example.data.WhatsAppAlertCategory
 import com.example.data.WhatsAppDirection
 import com.example.data.WhatsAppMessageEntity
@@ -156,6 +164,9 @@ data class AgroSightUiState(
     // 11. Open-Source Satellite Imagery (Sentinel-2 STAC + WMTS Tile + Georeferenced Raster Engine) & NASA POWER + Cited Formula Audit
     val isSyncingOpenSourceSatellite: Boolean = false,
     val isRunningGeoreferencedRasterJob: Boolean = false,
+    val rasterJobStatusAr: String = "",
+    val rasterJobProgressPct: Int = 0,
+    val rasterBackendErrorAr: String? = null,
     val showRealOpticalSatelliteUnderlay: Boolean = true,
     val satelliteAndNasaTelemetry: RealSatelliteAndNasaTelemetry? = null,
     val rasterBackendResult: GeoreferencedRasterBackendResult? = null,
@@ -169,6 +180,11 @@ data class AgroSightUiState(
     val cloudWorkspace: FarmerCloudWorkspace? = null,
     val cloudChatLogs: List<CloudChatLog> = emptyList(),
     val roomSqlAudits: List<SqlFieldAuditEntity> = emptyList(),
+    val cachedWeatherForecasts: List<CachedWeatherForecastEntity> = emptyList(),
+    val cachedSatelliteAnalyses: List<CachedSatelliteAnalysisEntity> = emptyList(),
+    val isServingFromRoomOfflineCache: Boolean = false,
+    val roomOfflineCacheStatusAr: String = "ذاكرة التخزين المؤقت المحلية (Room SQLite) جاهزة للعمل بدون إنترنت",
+    val lastOfflineCacheSyncIso: String = "",
     // 13. Gemini Multi-Turn Agronomy Chatbot + Voice Conversation + Google Search & Maps Grounding
     val geminiChatMessages: List<GeminiAgronomyChatMessage> = emptyList(),
     val isGeminiChatLoading: Boolean = false,
@@ -188,9 +204,10 @@ data class AgroSightUiState(
 
 class AgroSightViewModel(
     application: Application,
-    dependencies: AgroSightDependencies = AgroSightDependencies.createDefault(application)
+    dependencies: AgroSightDependencies
 ) : AndroidViewModel(application) {
 
+    @androidx.annotation.Keep
     constructor(application: Application) : this(
         application = application,
         dependencies = AgroSightDependencies.createDefault(application)
@@ -199,6 +216,7 @@ class AgroSightViewModel(
     private val databaseService: DatabaseService = dependencies.databaseService
     private val firestoreRepository: CloudWorkspaceRepository = dependencies.firestoreRepository
     private val sqlAuditDao = dependencies.sqlAuditDao
+    private val offlineTelemetryCacheRepository: OfflineTelemetryCacheDataSource = dependencies.offlineTelemetryCacheRepository
     private val openMeteoClient: MeteoForecastDataSource = dependencies.openMeteoClient
     private val openSourceSatelliteClient: SatelliteTelemetryDataSource = dependencies.openSourceSatelliteClient
     private val satelliteRasterBackendRepository: SatelliteRasterBackendRepository = dependencies.satelliteRasterBackendRepository
@@ -726,7 +744,7 @@ class AgroSightViewModel(
 
     private fun launchDirectWhatsAppIntent(waMeUrl: String) {
         try {
-            val uri = Uri.parse(waMeUrl)
+            val uri = waMeUrl.toUri()
             // Security Guard: Only allow HTTPS wa.me outbound links
             if (!uri.scheme.equals("https", ignoreCase = true) ||
                 !uri.host.equals("wa.me", ignoreCase = true)
@@ -1154,7 +1172,7 @@ class AgroSightViewModel(
                     snapshot.daysAfterSowing < 90 -> 2
                     else -> 3
                 }
-                val rasterResult = satelliteRasterBackendRepository.runFullGeoreferencedSatelliteAnalysis(
+                val rasterOutcome = satelliteRasterBackendRepository.runFullGeoreferencedSatelliteAnalysis(
                     farmId = snapshot.fieldId,
                     ownerUid = snapshot.firebaseUserUid ?: snapshot.activeFarmer.id,
                     cropId = snapshot.selectedCrop.id,
@@ -1162,18 +1180,131 @@ class AgroSightViewModel(
                     centerLat = snapshot.latitude,
                     centerLon = snapshot.longitude,
                     areaFeddans = snapshot.areaFeddans,
-                    customPolygonGeoJson = polygonGeoJson
-                ).getOrNull()
+                    customPolygonGeoJson = polygonGeoJson,
+                    onProgressUpdate = { _, pct, badgeAr ->
+                        _uiState.update {
+                            it.copy(
+                                rasterJobStatusAr = badgeAr,
+                                rasterJobProgressPct = pct
+                            )
+                        }
+                    }
+                )
+                val rasterResult = rasterOutcome.getOrNull()
+                val rasterErr = rasterOutcome.exceptionOrNull()?.message
+
+                // 1. Weather Data Room SQLite Caching & Offline Fallback
+                var effectiveMeteoResult = result
+                var usedRoomWeatherCache = false
+                var latestCacheIso = result.lastSuccessfulSyncIso
+                try {
+                    val existingWeatherCache = offlineTelemetryCacheRepository.getCachedWeatherForecast(
+                        fieldId = snapshot.fieldId,
+                        latitude = snapshot.latitude,
+                        longitude = snapshot.longitude
+                    )
+                    if (result.isLiveConnected) {
+                        val saved = offlineTelemetryCacheRepository.cacheWeatherForecast(
+                            fieldId = snapshot.fieldId,
+                            fieldName = snapshot.fieldName,
+                            latitude = snapshot.latitude,
+                            longitude = snapshot.longitude,
+                            baseKc = snapshot.growthEvaluation.currentBaseKc,
+                            meteoResult = result
+                        )
+                        latestCacheIso = saved.cachedAtIso
+                    } else if (existingWeatherCache != null) {
+                        val restored = OfflineTelemetryCacheSerializer.toOpenMeteoResultFromCache(existingWeatherCache)
+                        if (restored.records.isNotEmpty()) {
+                            effectiveMeteoResult = restored
+                            usedRoomWeatherCache = true
+                            latestCacheIso = existingWeatherCache.cachedAtIso
+                        }
+                    } else {
+                        val saved = offlineTelemetryCacheRepository.cacheWeatherForecast(
+                            fieldId = snapshot.fieldId,
+                            fieldName = snapshot.fieldName,
+                            latitude = snapshot.latitude,
+                            longitude = snapshot.longitude,
+                            baseKc = snapshot.growthEvaluation.currentBaseKc,
+                            meteoResult = result
+                        )
+                        latestCacheIso = saved.cachedAtIso
+                    }
+                } catch (_: Exception) {
+                }
+
+                // 2. Satellite Analysis & Georeferenced Raster Room SQLite Caching & Offline Fallback
+                var effectiveSatAndNasa = satAndNasa
+                var effectiveRasterResult = rasterResult
+                var usedRoomSatelliteCache = false
+                val isLiveSat = satAndNasa.dataMode == TelemetryDataMode.LIVE || rasterResult != null
+                try {
+                    val existingSatCache = offlineTelemetryCacheRepository.getCachedSatelliteAnalysis(
+                        fieldId = snapshot.fieldId,
+                        latitude = snapshot.latitude,
+                        longitude = snapshot.longitude
+                    )
+                    if (isLiveSat) {
+                        val savedSat = offlineTelemetryCacheRepository.cacheSatelliteAnalysis(
+                            fieldId = snapshot.fieldId,
+                            fieldName = snapshot.fieldName,
+                            cropNameAr = snapshot.selectedCrop.nameAr,
+                            latitude = snapshot.latitude,
+                            longitude = snapshot.longitude,
+                            areaFeddans = snapshot.areaFeddans,
+                            telemetry = satAndNasa,
+                            epidemiologyReport = snapshot.epidemiologyReport,
+                            rasterBackendResult = rasterResult
+                        )
+                        latestCacheIso = savedSat.cachedAtIso
+                    } else if (existingSatCache != null) {
+                        effectiveSatAndNasa = OfflineTelemetryCacheSerializer.toSatelliteTelemetryFromCache(existingSatCache)
+                        if (existingSatCache.rasterBackendResultJson.isNotBlank()) {
+                            effectiveRasterResult = OfflineTelemetryCacheSerializer.deserializeRasterBackendResult(
+                                existingSatCache.rasterBackendResultJson
+                            )
+                        }
+                        usedRoomSatelliteCache = true
+                        latestCacheIso = existingSatCache.cachedAtIso
+                    } else {
+                        val savedSat = offlineTelemetryCacheRepository.cacheSatelliteAnalysis(
+                            fieldId = snapshot.fieldId,
+                            fieldName = snapshot.fieldName,
+                            cropNameAr = snapshot.selectedCrop.nameAr,
+                            latitude = snapshot.latitude,
+                            longitude = snapshot.longitude,
+                            areaFeddans = snapshot.areaFeddans,
+                            telemetry = satAndNasa,
+                            epidemiologyReport = snapshot.epidemiologyReport,
+                            rasterBackendResult = rasterResult
+                        )
+                        latestCacheIso = savedSat.cachedAtIso
+                    }
+                } catch (_: Exception) {
+                }
+
+                val isUsingRoomOfflineCache = usedRoomWeatherCache || usedRoomSatelliteCache
+                val cacheStatusText = if (isUsingRoomOfflineCache) {
+                    "وضع العمل بدون إنترنت (Room SQLite Cache): تم استرجاع الأرصاد وتحليل القمر الصناعي من الذاكرة المحلية ($latestCacheIso)"
+                } else {
+                    "تم تحديث وحفظ بيانات الأرصاد ونتائج القمر الصناعي في Room SQLite للعمل بدون إنترنت ($latestCacheIso)"
+                }
 
                 _uiState.update { current ->
                     recalculateDerivedState(
                         current.copy(
-                            isLiveMeteoConnected = result.isLiveConnected,
-                            meteoStatusAr = result.statusMessageAr,
-                            forecastDays = result.records,
-                            climaticAlerts = result.alerts,
-                            satelliteAndNasaTelemetry = satAndNasa,
-                            rasterBackendResult = rasterResult ?: current.rasterBackendResult
+                            isLiveMeteoConnected = effectiveMeteoResult.isLiveConnected,
+                            meteoStatusAr = effectiveMeteoResult.statusMessageAr,
+                            forecastDays = effectiveMeteoResult.records,
+                            climaticAlerts = effectiveMeteoResult.alerts,
+                            satelliteAndNasaTelemetry = effectiveSatAndNasa,
+                            rasterBackendResult = effectiveRasterResult,
+                            rasterBackendErrorAr = if (effectiveRasterResult != null) null else rasterErr,
+                            rasterJobStatusAr = effectiveRasterResult?.executionState?.badgeAr ?: (rasterErr ?: ""),
+                            isServingFromRoomOfflineCache = isUsingRoomOfflineCache,
+                            roomOfflineCacheStatusAr = cacheStatusText,
+                            lastOfflineCacheSyncIso = latestCacheIso
                         )
                     )
                 }
@@ -1192,12 +1323,21 @@ class AgroSightViewModel(
 
     fun runGeoreferencedRasterAnalysis(
         customPolygonGeoJson: String? = null,
-        explicitAuthToken: String? = null
+        explicitAuthToken: String? = null,
+        dateStartIso: String? = null,
+        dateEndIso: String? = null
     ) {
         rasterJob?.cancel()
         rasterJob = viewModelScope.launch {
             val snapshot = _uiState.value
-            _uiState.update { it.copy(isRunningGeoreferencedRasterJob = true) }
+            _uiState.update {
+                it.copy(
+                    isRunningGeoreferencedRasterJob = true,
+                    rasterBackendErrorAr = null,
+                    rasterJobProgressPct = 5,
+                    rasterJobStatusAr = "في قائمة الانتظار للمعالجة الطيفية (QUEUED)..."
+                )
+            }
             try {
                 val polygonGeoJson = customPolygonGeoJson ?: buildFarmBoundaryGeoJsonPolygon(
                     centerLat = snapshot.latitude,
@@ -1219,13 +1359,83 @@ class AgroSightViewModel(
                     centerLon = snapshot.longitude,
                     areaFeddans = snapshot.areaFeddans,
                     customPolygonGeoJson = polygonGeoJson,
-                    explicitAuthToken = explicitAuthToken
+                    explicitAuthToken = explicitAuthToken,
+                    dateStartIso = dateStartIso,
+                    dateEndIso = dateEndIso,
+                    onProgressUpdate = { _, pct, badgeAr ->
+                        _uiState.update {
+                            it.copy(
+                                rasterJobStatusAr = badgeAr,
+                                rasterJobProgressPct = pct
+                            )
+                        }
+                    }
                 )
                 rasterOutcome.onSuccess { rasterRes ->
+                    var savedIso = _uiState.value.lastOfflineCacheSyncIso
+                    try {
+                        val currentSt = _uiState.value
+                        val telemetry = currentSt.satelliteAndNasaTelemetry
+                        if (telemetry != null) {
+                            val cachedEntity = offlineTelemetryCacheRepository.cacheSatelliteAnalysis(
+                                fieldId = currentSt.fieldId,
+                                fieldName = currentSt.fieldName,
+                                cropNameAr = currentSt.selectedCrop.nameAr,
+                                latitude = currentSt.latitude,
+                                longitude = currentSt.longitude,
+                                areaFeddans = currentSt.areaFeddans,
+                                telemetry = telemetry,
+                                epidemiologyReport = currentSt.epidemiologyReport,
+                                rasterBackendResult = rasterRes
+                            )
+                            savedIso = cachedEntity.cachedAtIso
+                        }
+                    } catch (_: Exception) {
+                    }
                     _uiState.update { current ->
                         recalculateDerivedState(
                             current.copy(
-                                rasterBackendResult = rasterRes
+                                rasterBackendResult = rasterRes,
+                                rasterBackendErrorAr = null,
+                                rasterJobProgressPct = 100,
+                                rasterJobStatusAr = rasterRes.executionState.badgeAr,
+                                isServingFromRoomOfflineCache = false,
+                                lastOfflineCacheSyncIso = savedIso,
+                                roomOfflineCacheStatusAr = "تم حفظ نتيجة التحليل الطيفي المرجعي (${rasterRes.sceneId}) في Room SQLite للعمل بدون إنترنت"
+                            )
+                        )
+                    }
+                }.onFailure { err ->
+                    val errMsg = err.message ?: "تعذر إكمال المعالجة الطيفية على الخادم"
+                    val cachedSat = runCatching {
+                        offlineTelemetryCacheRepository.getCachedSatelliteAnalysis(
+                            fieldId = snapshot.fieldId,
+                            latitude = snapshot.latitude,
+                            longitude = snapshot.longitude
+                        )
+                    }.getOrNull()
+                    val cachedRaster = cachedSat?.rasterBackendResultJson
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { OfflineTelemetryCacheSerializer.deserializeRasterBackendResult(it) }
+
+                    _uiState.update { current ->
+                        recalculateDerivedState(
+                            current.copy(
+                                rasterBackendResult = cachedRaster,
+                                rasterBackendErrorAr = errMsg,
+                                rasterJobProgressPct = if (cachedRaster != null) 100 else 0,
+                                rasterJobStatusAr = if (cachedRaster != null) {
+                                    "[CACHED • Room SQLite] ${cachedRaster.executionState.badgeAr}"
+                                } else {
+                                    errMsg
+                                },
+                                isServingFromRoomOfflineCache = cachedRaster != null,
+                                roomOfflineCacheStatusAr = if (cachedRaster != null) {
+                                    "تعذر الاتصال بالخادم — تم استعادة نتيجة القمر الصناعي من ذاكرة Room SQLite (${cachedSat.cachedAtIso})"
+                                } else {
+                                    current.roomOfflineCacheStatusAr
+                                },
+                                lastWhatsAppBannerNotificationAr = "⚠️ تنبيه خادم الأقمار الصناعية: $errMsg"
                             )
                         )
                     }
@@ -1469,7 +1679,11 @@ class AgroSightViewModel(
 
     private fun observeFirebaseAuthAndCloudStreams() {
         viewModelScope.launch {
-            firestoreRepository.observeAuthState().collect { user ->
+            firestoreRepository.observeAuthState()
+                .catch { e ->
+                    if (e is CancellationException) throw e
+                }
+                .collect { user ->
                 firestoreWorkspaceJob?.cancel()
                 firestoreChatLogsJob?.cancel()
 
@@ -1535,8 +1749,162 @@ class AgroSightViewModel(
                 }
             } catch (_: Exception) {
             }
-            sqlAuditDao.observeAllAudits().collect { audits ->
-                _uiState.update { it.copy(roomSqlAudits = audits) }
+            sqlAuditDao.observeAllAudits()
+                .catch { e ->
+                    if (e is CancellationException) throw e
+                }
+                .collect { audits ->
+                    _uiState.update { it.copy(roomSqlAudits = audits) }
+                }
+        }
+        viewModelScope.launch {
+            offlineTelemetryCacheRepository.allCachedWeatherForecasts
+                .catch { e ->
+                    if (e is CancellationException) throw e
+                }
+                .collect { weatherList ->
+                    _uiState.update { state ->
+                        val latestSync = weatherList.firstOrNull()?.cachedAtIso ?: state.lastOfflineCacheSyncIso
+                        state.copy(
+                            cachedWeatherForecasts = weatherList,
+                            lastOfflineCacheSyncIso = latestSync
+                        )
+                    }
+                }
+        }
+        viewModelScope.launch {
+            offlineTelemetryCacheRepository.allCachedSatelliteAnalyses
+                .catch { e ->
+                    if (e is CancellationException) throw e
+                }
+                .collect { satList ->
+                    _uiState.update { state ->
+                        val latestSync = satList.firstOrNull()?.cachedAtIso ?: state.lastOfflineCacheSyncIso
+                        state.copy(
+                            cachedSatelliteAnalyses = satList,
+                            lastOfflineCacheSyncIso = latestSync
+                        )
+                    }
+                }
+        }
+    }
+
+    fun cacheCurrentTelemetryToRoomForOffline() {
+        val st = _uiState.value
+        viewModelScope.launch {
+            try {
+                val meteoRes = com.example.data.OpenMeteoResult(
+                    records = st.forecastDays,
+                    isLiveConnected = st.isLiveMeteoConnected,
+                    statusMessageAr = st.meteoStatusAr,
+                    alerts = st.climaticAlerts,
+                    httpStatusCode = if (st.isLiveMeteoConnected) 200 else 0,
+                    latencyMs = 1L,
+                    lastSuccessfulSyncIso = st.lastOfflineCacheSyncIso.ifBlank { DatabaseService.currentTimeFormatted() }
+                )
+                val cachedWeather = offlineTelemetryCacheRepository.cacheWeatherForecast(
+                    fieldId = st.fieldId,
+                    fieldName = st.fieldName,
+                    latitude = st.latitude,
+                    longitude = st.longitude,
+                    baseKc = st.growthEvaluation.currentBaseKc,
+                    meteoResult = meteoRes
+                )
+                val telemetry = st.satelliteAndNasaTelemetry ?: openSourceSatelliteClient.fetchLiveOpenSourceSatelliteAndNasaData(
+                    latitude = st.latitude,
+                    longitude = st.longitude
+                )
+                val cachedSat = offlineTelemetryCacheRepository.cacheSatelliteAnalysis(
+                    fieldId = st.fieldId,
+                    fieldName = st.fieldName,
+                    cropNameAr = st.selectedCrop.nameAr,
+                    latitude = st.latitude,
+                    longitude = st.longitude,
+                    areaFeddans = st.areaFeddans,
+                    telemetry = telemetry,
+                    epidemiologyReport = st.epidemiologyReport,
+                    rasterBackendResult = st.rasterBackendResult
+                )
+                _uiState.update {
+                    it.copy(
+                        lastOfflineCacheSyncIso = cachedSat.cachedAtIso,
+                        roomOfflineCacheStatusAr = "تم تثبيت بيانات الأرصاد (7 أيام) وتحليل القمر الصناعي (${cachedSat.sceneId}) في Room SQLite للعمل بدون إنترنت (${cachedWeather.cachedAtIso})",
+                        lastWhatsAppBannerNotificationAr = "تم حفظ نتائج القمر الصناعي والأرصاد في قاعدة بيانات Room SQLite للعمل بدون إنترنت ✅"
+                    )
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun restoreTelemetryFromRoomOfflineCache() {
+        val st = _uiState.value
+        viewModelScope.launch {
+            try {
+                val cachedWeather = offlineTelemetryCacheRepository.getCachedWeatherForecast(
+                    fieldId = st.fieldId,
+                    latitude = st.latitude,
+                    longitude = st.longitude
+                )
+                val cachedSat = offlineTelemetryCacheRepository.getCachedSatelliteAnalysis(
+                    fieldId = st.fieldId,
+                    latitude = st.latitude,
+                    longitude = st.longitude
+                )
+                if (cachedWeather == null && cachedSat == null) {
+                    _uiState.update {
+                        it.copy(
+                            roomOfflineCacheStatusAr = "لا توجد بيانات مخزنة مؤقتاً لهذا الحقل بعد — اضغط حفظ لتخزين القراءات الحالية",
+                            lastWhatsAppBannerNotificationAr = "ℹ️ لا توجد نسخة مخزنة في Room SQLite لهذا الحقل حالياً"
+                        )
+                    }
+                    return@launch
+                }
+                val restoredMeteo = cachedWeather?.let {
+                    OfflineTelemetryCacheSerializer.toOpenMeteoResultFromCache(it)
+                }
+                val restoredSat = cachedSat?.let {
+                    OfflineTelemetryCacheSerializer.toSatelliteTelemetryFromCache(it)
+                }
+                val restoredRaster = cachedSat?.rasterBackendResultJson
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { OfflineTelemetryCacheSerializer.deserializeRasterBackendResult(it) }
+                val syncTime = cachedSat?.cachedAtIso ?: cachedWeather?.cachedAtIso.orEmpty()
+
+                _uiState.update { current ->
+                    recalculateDerivedState(
+                        current.copy(
+                            isLiveMeteoConnected = false,
+                            meteoStatusAr = restoredMeteo?.statusMessageAr ?: current.meteoStatusAr,
+                            forecastDays = restoredMeteo?.records?.takeIf { it.isNotEmpty() } ?: current.forecastDays,
+                            climaticAlerts = restoredMeteo?.alerts?.takeIf { it.isNotEmpty() } ?: current.climaticAlerts,
+                            satelliteAndNasaTelemetry = restoredSat ?: current.satelliteAndNasaTelemetry,
+                            rasterBackendResult = restoredRaster ?: current.rasterBackendResult,
+                            isServingFromRoomOfflineCache = true,
+                            lastOfflineCacheSyncIso = syncTime,
+                            roomOfflineCacheStatusAr = "تم تفعيل وضع عدم الاتصال: القراءات معروضة من ذاكرة Room SQLite المحلية ($syncTime)",
+                            lastWhatsAppBannerNotificationAr = "📡 تم استرجاع تحليل القمر الصناعي والأرصاد من ذاكرة Room SQLite المحلية بنجاح"
+                        )
+                    )
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun clearOfflineTelemetryCache() {
+        viewModelScope.launch {
+            try {
+                offlineTelemetryCacheRepository.clearAllOfflineCache()
+                _uiState.update {
+                    it.copy(
+                        isServingFromRoomOfflineCache = false,
+                        lastOfflineCacheSyncIso = "",
+                        roomOfflineCacheStatusAr = "تم مسح ذاكرة التخزين المؤقت المحلية (Room SQLite) للأرصاد والأقمار الصناعية",
+                        lastWhatsAppBannerNotificationAr = "تم مسح ذاكرة التخزين المؤقت (Room SQLite) بنجاح 🗑️"
+                    )
+                }
+            } catch (_: Exception) {
             }
         }
     }
@@ -1745,6 +2113,24 @@ class AgroSightViewModel(
 
     fun setVoiceSpeakingTtsState(speaking: Boolean) {
         _uiState.update { it.copy(isVoiceSpeakingTts = speaking) }
+    }
+
+    fun clearGeminiChatHistory() {
+        val st = _uiState.value
+        val welcomeMsg = GeminiAgronomyChatMessage(
+            id = "chat_welcome_${System.currentTimeMillis()}",
+            role = "ASSISTANT",
+            channel = "GEMINI_CHAT",
+            text = "أهلاً بك يا ${st.activeFarmer.fullName} 🌿\nتم بدء جلسة استشارية جديدة مربوطة ببيانات حقل *${st.fieldName}* (${st.selectedCrop.nameAr} - ${st.areaFeddans.toInt()} فدان).\nاسألني عن المقنن المائي، مؤشرات القمر الصناعي Sentinel-2، أو معادلة حموضة التربة.",
+            timestamp = DatabaseService.currentTimeFormatted(),
+            isLiveAiGenerated = false
+        )
+        _uiState.update {
+            it.copy(
+                geminiChatMessages = listOf(welcomeMsg),
+                isGeminiChatLoading = false
+            )
+        }
     }
 
     fun sendGeminiAgronomyChatMessage(

@@ -3,15 +3,19 @@ package com.example.data
 import com.example.BuildConfig
 import com.example.model.formatDecimal1
 import com.example.model.formatDecimal2
+import com.google.firebase.Firebase
+import com.google.firebase.ai.ai
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 data class GroundingCitation(
@@ -103,6 +107,11 @@ class GeminiAgroService(
     companion object {
         const val AGRONOMIC_SAFETY_DISCLAIMER_AR =
             "⚠️ تنويه إرشادي وعلمي: هذه التقديرات مبنية على نماذج استشعار عن بُعد ومعادلات FAO-56 الإرشادية؛ يُوصى بالمعاينة الحقلية ومراجعة مهندس زراعي معتمد قبل تطبيق الأحماض أو الكيماويات أو المبيدات."
+        private const val GEMINI_MODEL_ID = "gemini-3.8-flash"
+    }
+
+    private val firebaseAiModel by lazy {
+        Firebase.ai.generativeModel(GEMINI_MODEL_ID)
     }
 
     override suspend fun generateMultiTurnGroundedAgronomyReply(
@@ -127,19 +136,25 @@ class GeminiAgroService(
         report: EpidemiologyDiagnosisReport
     ): GeminiGroundedResponse = withContext(Dispatchers.IO) {
         val systemInstruction = """
-            أنت المستشار الزراعي الذكي (Gemini Agronomy & Remote Sensing Copilot) في منصة "أجرو سايت" (AgroSight) المصرية.
+            أنت المستشار الزراعي الذكي (Gemini Agronomy & Remote Sensing Copilot) في منصة "أجرو سايت" (AgroSight) المصرية، مربوط مباشرةً بخرائط Google Maps Satellite وأقمار Sentinel-2.
             القاعدة الذهبية: المنصة تعمل بالاستشعار عن بعد بالأقمار الصناعية (Sentinel-2: NDVI, NDRE, PSRI, NDMI) والأرصاد (Open-Meteo FAO-56) وكيمياء التربة (pH & ECe).
             بيانات الحقل الحالية للمزارع ($farmerName):
-            - الحقل: $fieldName في منطقة ($regionName) عند الإحداثيات (Lat=$latitude, Lon=$longitude) بمساحة ${areaFeddans.toInt()} فدان.
+            - الحقل: $fieldName في منطقة ($regionName) عند إحداثيات Google Maps (Lat=$latitude, Lon=$longitude) بمساحة ${areaFeddans.toInt()} فدان.
+            - رابط الموقع على خرائط Google Maps: https://www.google.com/maps/search/?api=1&query=$latitude,$longitude
             - المحصول: $cropNameAr | معامل المحصول Kc=${formatDecimal2(kcValue)} | البخر-نتح المرجعي ET0=${formatDecimal2(et0MmDay)} مم/يوم.
             - المقنن المائي اليومي المقدر: ${formatDecimal1(dailyM3PerFeddan)} م³/فدان (تشغيل المحبس ${formatDecimal1(valveRunHours)} ساعة).
             - كيمياء التربة والمياه: pH=${formatDecimal1(soilPh)} | ECe=${formatDecimal1(soilEc)} dS/m | ECw=${formatDecimal1(waterEc)} dS/m | جرعة الحامض الإرشادية=${formatDecimal1(report.acidDoseLitersPerFeddan)} لتر/فدان.
             - مؤشرات القمر الصناعي Sentinel-2: NDVI=${formatDecimal2(report.ndviMean)}, NDRE=${formatDecimal2(report.ndreMean)}, PSRI=${formatDecimal2(report.psriMean)}, NDMI=${formatDecimal2(report.ndmiMean)}.
             - المؤشر المكاني المرصود: ${report.detectedRiskNameAr} (${report.hotspotLocationAr}) بثقة تقديرية ${report.confidenceScorePct}%.
-            أجب باللغة العربية العلمية الواضحة، مع التمييز بين القراءات والتقديرات، واختم بتوصية مراجعة مهندس زراعي مختص قبل أي تطبيق كيميائي.
+            أجب باللغة العربية العلمية الواضحة مع ذكر الإحداثيات القطاعية على Google Maps، والتمييز بين القراءات والتقديرات، واختم بتوصية مراجعة مهندس زراعي مختص قبل أي تطبيق كيميائي.
         """.trimIndent()
 
         val defaultCitations = mutableListOf(
+            GroundingCitation(
+                title = "Google Maps Satellite View ($fieldName - $regionName: $latitude, $longitude)",
+                url = "https://www.google.com/maps/search/?api=1&query=$latitude,$longitude",
+                sourceType = "GOOGLE_MAPS"
+            ),
             GroundingCitation(
                 title = "Copernicus Sentinel-2 L2A Multi-Spectral STAC (${formatDecimal2(report.ndviMean)} NDVI)",
                 url = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
@@ -154,13 +169,23 @@ class GeminiAgroService(
         if (useGoogleMapsGrounding) {
             defaultCitations.add(
                 GroundingCitation(
-                    title = "Google Maps Spatial Sector Reference ($regionName: $latitude, $longitude)",
-                    url = "https://www.google.com/maps/@$latitude,$longitude,16z",
+                    title = "Google Maps Navigation & Field Boundary ($regionName @ $latitude,$longitude)",
+                    url = "https://www.google.com/maps/@$latitude,$longitude,16z/data=!3m1!1e3",
                     sourceType = "GOOGLE_MAPS"
                 )
             )
         }
         if (useGoogleSearchGrounding) {
+            val encodedCropQuery = runCatching {
+                URLEncoder.encode("$cropNameAr $regionName FAO-56 Sentinel-2", "UTF-8")
+            }.getOrDefault("FAO+56+crop+irrigation")
+            defaultCitations.add(
+                GroundingCitation(
+                    title = "Google Search Agronomy Grounding ($cropNameAr - $regionName)",
+                    url = "https://www.google.com/search?q=$encodedCropQuery",
+                    sourceType = "GOOGLE_SEARCH"
+                )
+            )
             defaultCitations.add(
                 GroundingCitation(
                     title = "FAO Agronomy & Crop Information Bulletins ($cropNameAr)",
@@ -182,20 +207,55 @@ class GeminiAgroService(
             dailyM3PerFeddan = dailyM3PerFeddan,
             valveRunHours = valveRunHours,
             report = report
-        ) + if (useGoogleSearchGrounding || useGoogleMapsGrounding) {
-            "\n\n🌐 *المراجع الإرشادية (Reference Citations):*\n" +
-                "• الموقع الجغرافي: `$latitude, $longitude` ($regionName)\n" +
-                "• Copernicus Sentinel-2 L2A & NASA POWER Agroclimatology\n" +
-                "• FAO Irrigation & Drainage Paper No. 56 / نشرات مركز البحوث الزراعية"
-        } else {
-            ""
-        } + "\n\n$AGRONOMIC_SAFETY_DISCLAIMER_AR"
+        ) + "\n\n📍 *موقع الحقل على Google Maps:* `$latitude, $longitude` ($regionName)\n" +
+            "🔗 https://www.google.com/maps/search/?api=1&query=$latitude,$longitude" +
+            if (useGoogleSearchGrounding || useGoogleMapsGrounding) {
+                "\n\n🌐 *المراجع الإرشادية (Reference Citations):*\n" +
+                    "• Google Maps Satellite: `$latitude, $longitude` ($regionName)\n" +
+                    "• Copernicus Sentinel-2 L2A & NASA POWER Agroclimatology\n" +
+                    "• FAO Irrigation & Drainage Paper No. 56 / نشرات مركز البحوث الزراعية"
+            } else {
+                ""
+            } + "\n\n$AGRONOMIC_SAFETY_DISCLAIMER_AR"
 
+        // 1. Primary Cloud Path: Firebase AI Logic (Gemini 3.8 Flash via App Check, no manual API key required)
+        try {
+            val historyTranscript = chatHistory.takeLast(6).joinToString("\n") { msg ->
+                val speaker = if (msg.role == "USER") "المزارع ($farmerName)" else "المستشار الذكي (AgroSight Gemini)"
+                "$speaker: ${msg.text}"
+            }
+            val fullPrompt = buildString {
+                appendLine(systemInstruction)
+                if (historyTranscript.isNotBlank()) {
+                    appendLine("\n--- سياق المحادثة السابقة ---")
+                    appendLine(historyTranscript)
+                }
+                appendLine("\n--- سؤال المزارع الحالي ---")
+                appendLine(userMessage)
+            }
+            val aiResponse = withTimeout(60_000L) {
+                firebaseAiModel.generateContent(fullPrompt)
+            }
+            val liveText = aiResponse.text?.trim()
+            if (!liveText.isNullOrBlank()) {
+                return@withContext GeminiGroundedResponse(
+                    replyText = "$liveText\n\n$AGRONOMIC_SAFETY_DISCLAIMER_AR",
+                    citations = defaultCitations.distinctBy { it.url },
+                    isLiveAiGenerated = true
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            // Fall through to REST API key check or deterministic fallback
+        }
+
+        // 2. Secondary REST Path if custom BuildConfig.GEMINI_API_KEY is explicitly configured
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
             return@withContext GeminiGroundedResponse(
                 replyText = fallbackReply,
-                citations = defaultCitations,
+                citations = defaultCitations.distinctBy { it.url },
                 isLiveAiGenerated = false
             )
         }
@@ -241,7 +301,7 @@ class GeminiAgroService(
                 )
             }
 
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL_ID:generateContent"
             val body = requestJson.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder()
                 .url(url)
@@ -399,7 +459,23 @@ class GeminiAgroService(
         callGeminiRestOrFallback(prompt = prompt, fallbackText = fallbackText)
     }
 
-    private fun callGeminiRestOrFallback(prompt: String, fallbackText: String): String {
+    private suspend fun callGeminiRestOrFallback(prompt: String, fallbackText: String): String {
+        // 1. Primary Cloud Path: Firebase AI Logic (Gemini 3.8 Flash via App Check)
+        try {
+            val aiResponse = withTimeout(60_000L) {
+                firebaseAiModel.generateContent(prompt)
+            }
+            val liveText = aiResponse.text?.trim()
+            if (!liveText.isNullOrBlank()) {
+                return "$liveText\n\n$AGRONOMIC_SAFETY_DISCLAIMER_AR"
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            // Fall through to REST API key check or deterministic fallback
+        }
+
+        // 2. Secondary REST Path if custom BuildConfig.GEMINI_API_KEY is explicitly configured
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
             return fallbackText
@@ -424,7 +500,7 @@ class GeminiAgroService(
                 )
             }
 
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL_ID:generateContent"
             val body = requestJson.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder()
                 .url(url)

@@ -1,5 +1,8 @@
+@file:SuppressLint("NewApi")
+
 package com.example.data
 
+import android.annotation.SuppressLint
 import com.example.model.AgroClimaticAlert
 import com.example.model.AlertSeverity
 import com.example.model.DailyMeteoRecord

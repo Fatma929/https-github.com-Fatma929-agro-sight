@@ -16,10 +16,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Calculate
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudSync
-import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SatelliteAlt
@@ -548,7 +548,7 @@ private fun CitationFormulaBlock(item: ScientificCitationItem) {
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Icon(
-                imageVector = Icons.Default.MenuBook,
+                imageVector = Icons.AutoMirrored.Filled.MenuBook,
                 contentDescription = null,
                 tint = Slate600,
                 modifier = Modifier.size(15.dp)

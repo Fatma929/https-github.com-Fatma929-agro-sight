@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import androidx.activity.compose.BackHandler
+import androidx.core.net.toUri
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
@@ -9,6 +10,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,6 +26,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
@@ -78,19 +81,26 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.R
 import com.example.data.AnomalyPattern
 import com.example.data.FieldEntity
 import com.example.model.AppScreen
 import com.example.model.formatDecimal1
 import com.example.model.formatDecimal2
 import com.example.ui.theme.AmberLight
+import com.example.ui.theme.AmberSoft
+import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.CyanLight
+import com.example.ui.theme.EmeraldPrimary
+import com.example.ui.theme.EmeraldSoft
 import com.example.ui.theme.ForestBgDark
 import com.example.ui.theme.ForestBgDeep
 import com.example.ui.theme.ForestBgMid
@@ -105,6 +115,8 @@ import com.example.ui.theme.MintTextMuted
 import com.example.ui.theme.MintTextPrimary
 import com.example.ui.theme.MintTextSoft
 import com.example.ui.theme.RoseLight
+import com.example.ui.theme.SkyAccent
+import com.example.ui.theme.SkySoft
 import com.example.viewmodel.AgroSightUiState
 import kotlin.math.roundToInt
 
@@ -122,6 +134,12 @@ fun HomeDashboardScreen(
     onOpenAuthModal: () -> Unit,
     onSendMorningWhatsAppReport: () -> Unit,
     onRefreshTelemetry: () -> Unit,
+    onSelectSatelliteLayer: (com.example.model.SatelliteLayer) -> Unit = {},
+    onSelectValveSector: (Int) -> Unit = {},
+    onAskGeminiAboutSector: (String) -> Unit = {},
+    onCacheCurrentTelemetryToRoom: () -> Unit = {},
+    onRestoreTelemetryFromRoomCache: () -> Unit = {},
+    onClearOfflineTelemetryCache: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var subMode by rememberSaveable { mutableStateOf(HomeSubMode.MAIN_DASHBOARD) }
@@ -144,6 +162,7 @@ fun HomeDashboardScreen(
                     )
                 )
             )
+            .statusBarsPadding()
             .testTag("home_dashboard_screen")
     ) {
         AnimatedContent(
@@ -165,13 +184,20 @@ fun HomeDashboardScreen(
                         onToggleWelcomeCover = { subMode = HomeSubMode.WELCOME_COVER },
                         onDismissHeroBanner = { showHeroWelcomeBanner = false },
                         onNavigateToScreen = onNavigateToScreen,
+                        onSelectField = onSelectField,
                         onSelectFieldAndOpenDetail = { fieldId ->
                             onSelectField(fieldId)
                             subMode = HomeSubMode.FIELD_DETAIL
                         },
                         onOpenFieldDetail = { subMode = HomeSubMode.FIELD_DETAIL },
                         onOpenAuthModal = onOpenAuthModal,
-                        onSendMorningWhatsAppReport = onSendMorningWhatsAppReport
+                        onSendMorningWhatsAppReport = onSendMorningWhatsAppReport,
+                        onSelectSatelliteLayer = onSelectSatelliteLayer,
+                        onSelectValveSector = onSelectValveSector,
+                        onAskGeminiAboutSector = onAskGeminiAboutSector,
+                        onCacheCurrentTelemetryToRoom = onCacheCurrentTelemetryToRoom,
+                        onRestoreTelemetryFromRoomCache = onRestoreTelemetryFromRoomCache,
+                        onClearOfflineTelemetryCache = onClearOfflineTelemetryCache
                     )
                 }
 
@@ -432,7 +458,7 @@ private fun FullScreenWelcomeHeroCover(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Text(
-                        text = ">>>",
+                        text = "←",
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Black
                     )
@@ -453,10 +479,17 @@ private fun MainHomeOverviewContent(
     onToggleWelcomeCover: () -> Unit,
     onDismissHeroBanner: () -> Unit,
     onNavigateToScreen: (AppScreen) -> Unit,
+    onSelectField: (String) -> Unit,
     onSelectFieldAndOpenDetail: (String) -> Unit,
     onOpenFieldDetail: () -> Unit,
     onOpenAuthModal: () -> Unit,
-    onSendMorningWhatsAppReport: () -> Unit
+    onSendMorningWhatsAppReport: () -> Unit,
+    onSelectSatelliteLayer: (com.example.model.SatelliteLayer) -> Unit = {},
+    onSelectValveSector: (Int) -> Unit = {},
+    onAskGeminiAboutSector: (String) -> Unit = {},
+    onCacheCurrentTelemetryToRoom: () -> Unit = {},
+    onRestoreTelemetryFromRoomCache: () -> Unit = {},
+    onClearOfflineTelemetryCache: () -> Unit = {}
 ) {
     val today = uiState.forecastDays.firstOrNull()
     val tempInt = (today?.tempMaxC ?: 32f).roundToInt()
@@ -507,6 +540,28 @@ private fun MainHomeOverviewContent(
                 windKmh = windKmh,
                 et0Mm = et0Mm,
                 onClick = { onNavigateToScreen(AppScreen.METEO_ANALYTICS) }
+            )
+        }
+
+        // 3B. Google Maps SDK & Mapbox Field Boundaries + Satellite Imagery Overlays Card
+        item {
+            com.example.ui.components.DashboardSatelliteMapCard(
+                uiState = uiState,
+                onSelectLayer = onSelectSatelliteLayer,
+                onSelectValve = onSelectValveSector,
+                onSelectField = onSelectField,
+                onExpandFullSatelliteScreen = { onNavigateToScreen(AppScreen.SATELLITE_NDVI_MAP) },
+                onAskGeminiAboutSector = onAskGeminiAboutSector
+            )
+        }
+
+        // 3C. Room Database Offline Caching Card (Weather Forecast + Satellite Analysis Resilience)
+        item {
+            OfflineRoomTelemetryCacheCard(
+                uiState = uiState,
+                onCacheCurrentToRoom = onCacheCurrentTelemetryToRoom,
+                onRestoreFromRoomCache = onRestoreTelemetryFromRoomCache,
+                onClearRoomCache = onClearOfflineTelemetryCache
             )
         }
 
@@ -654,26 +709,20 @@ private fun HomeGreetingHeader(
                 .padding(vertical = 4.dp)
                 .testTag("home_profile_header")
         ) {
-            // Circular Farmer Avatar with Lime Border
-            Box(
+            // Official AgroSight Logo Badge with Botanical Green & Satellite Pixel Blue Border
+            Image(
+                painter = painterResource(id = R.drawable.img_agrosight_logo),
+                contentDescription = "شعار أجرو سايت — AgroSight Logo",
+                contentScale = ContentScale.Crop,
                 modifier = Modifier
-                    .size(48.dp)
-                    .clip(CircleShape)
-                    .background(
-                        Brush.linearGradient(
-                            colors = listOf(LimeAccent, ForestCardElevated)
-                        )
+                    .size(52.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .border(
+                        width = 1.5.dp,
+                        brush = Brush.linearGradient(colors = listOf(EmeraldPrimary, SkyAccent)),
+                        shape = RoundedCornerShape(14.dp)
                     )
-                    .border(2.dp, LimeBright, CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = Icons.Default.AccountCircle,
-                    contentDescription = "حساب المزارع",
-                    tint = ForestBgDeep,
-                    modifier = Modifier.size(34.dp)
-                )
-            }
+            )
 
             Column {
                 Row(
@@ -690,9 +739,17 @@ private fun HomeGreetingHeader(
                     )
                 }
                 Text(
+                    text = "AGROSIGHT • PRECISION AGRI-INSIGHTS FROM ABOVE",
+                    color = SkyAccent,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
                     text = "إليك ما يحدث في مزرعتك اليوم • ${uiState.activeFarmer.region}",
                     color = MintTextSoft,
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -716,7 +773,7 @@ private fun HomeGreetingHeader(
                     Icon(
                         imageVector = Icons.Default.AdminPanelSettings,
                         contentDescription = "بوابة الإدارة",
-                        tint = LimeBright,
+                        tint = EmeraldPrimary,
                         modifier = Modifier.size(22.dp)
                     )
                 }
@@ -742,7 +799,7 @@ private fun HomeGreetingHeader(
                         modifier = Modifier
                             .size(9.dp)
                             .clip(CircleShape)
-                            .background(LimeBright)
+                            .background(SkyAccent)
                             .align(Alignment.TopEnd)
                     )
                 }
@@ -760,7 +817,7 @@ private fun CompactDroneHeroCard(
     Card(
         shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(containerColor = ForestCardDark),
-        border = BorderStroke(1.dp, ForestCardBorder),
+        border = BorderStroke(1.2.dp, ForestCardBorder),
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onOpenFullCover)
@@ -771,8 +828,9 @@ private fun CompactDroneHeroCard(
                 .background(
                     Brush.horizontalGradient(
                         colors = listOf(
-                            Color(0xFF1A4728),
-                            Color(0xFF10301B)
+                            Color(0xFFEAF3EE),
+                            Color(0xFFF6FAF7),
+                            Color(0xFFE3F2FA)
                         )
                     )
                 )
@@ -785,22 +843,22 @@ private fun CompactDroneHeroCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Surface(
-                        color = LimeAccent.copy(alpha = 0.2f),
+                        color = SkySoft,
                         shape = RoundedCornerShape(50),
-                        border = BorderStroke(1.dp, LimeAccent.copy(alpha = 0.5f))
+                        border = BorderStroke(1.dp, SkyAccent.copy(alpha = 0.45f))
                     ) {
                         Text(
-                            text = "🛰️ الجيل الجديد من الزراعة الذكية",
-                            color = LimeBright,
+                            text = "🛰️ الجيل الجديد من الزراعة الذكية • AGROSIGHT",
+                            color = SkyAccent,
                             fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
+                            fontWeight = FontWeight.ExtraBold,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                         )
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = "مزرعتك في مستوى جديد من الدقة!",
-                        color = MintTextPrimary,
+                        color = EmeraldPrimary,
                         fontSize = 17.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
@@ -816,22 +874,22 @@ private fun CompactDroneHeroCard(
                             onClick = onStartFieldInspection,
                             shape = RoundedCornerShape(50),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = LimeAccent,
-                                contentColor = ForestBgDeep
+                                containerColor = EmeraldPrimary,
+                                contentColor = Color.White
                             ),
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                             modifier = Modifier.height(36.dp)
                         ) {
                             Text(
-                                text = "فحص الحقل الآن >>>",
+                                text = "فحص الحقل الآن ←",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.ExtraBold
                             )
                         }
                         Surface(
-                            color = Color.Transparent,
+                            color = ForestCardDark,
                             shape = RoundedCornerShape(50),
-                            border = BorderStroke(1.dp, ForestCardBorder),
+                            border = BorderStroke(1.dp, SkyAccent),
                             modifier = Modifier
                                 .height(36.dp)
                                 .clip(RoundedCornerShape(50))
@@ -843,9 +901,9 @@ private fun CompactDroneHeroCard(
                             ) {
                                 Text(
                                     text = "عرض الغلاف",
-                                    color = MintTextSoft,
+                                    color = SkyAccent,
                                     fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold
+                                    fontWeight = FontWeight.Bold
                                 )
                             }
                         }
@@ -1324,13 +1382,120 @@ private fun StreamlinedModulesQuickRow(
     onNavigateToScreen: (AppScreen) -> Unit,
     onSendMorningWhatsAppReport: () -> Unit
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
-            text = "الأدوات الذكية السريعة",
+            text = "خرائط Google Maps والشات بوت الذكي (Gemini & WhatsApp)",
             color = MintTextPrimary,
             fontSize = 16.sp,
             fontWeight = FontWeight.ExtraBold
         )
+
+        Card(
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = ForestCardElevated),
+            border = BorderStroke(1.dp, LimeAccent.copy(alpha = 0.65f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("home_google_maps_and_chatbots_hub_card")
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "🗺️ ربط مباشر مع Google Maps وشات Gemini 3.8",
+                            color = LimeBright,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            text = "الموقع الحالي: ${uiState.activeFarmer.region} (${formatDecimal2(uiState.latitude.toFloat())}°N, ${formatDecimal2(uiState.longitude.toFloat())}°E)",
+                            color = MintTextSoft,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = { onNavigateToScreen(AppScreen.CHATBOT) },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = LimeAccent,
+                            contentColor = ForestBgDeep
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("home_open_gemini_chatbot_btn")
+                    ) {
+                        Text(
+                            text = "🤖 شات Gemini + خرائط",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+
+                    Button(
+                        onClick = { onNavigateToScreen(AppScreen.WHATSAPP_BOT) },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF075E54),
+                            contentColor = Color.White
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("home_open_whatsapp_chatbot_btn")
+                    ) {
+                        Text(
+                            text = "💬 شات بوت واتساب",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+
+                    Button(
+                        onClick = {
+                            try {
+                                val uri = "https://www.google.com/maps/search/?api=1&query=${uiState.latitude},${uiState.longitude}".toUri()
+                                context.startActivity(
+                                    android.content.Intent(android.content.Intent.ACTION_VIEW, uri)
+                                )
+                            } catch (_: Exception) {
+                                onNavigateToScreen(AppScreen.SATELLITE_NDVI_MAP)
+                            }
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ForestCardDark,
+                            contentColor = CyanLight
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                        modifier = Modifier
+                            .weight(0.95f)
+                            .testTag("home_open_google_maps_btn")
+                    ) {
+                        Text(
+                            text = "📍 Google Maps",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+                }
+            }
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1571,8 +1736,8 @@ private fun FieldDetailStreamlinedView(
 
                         RecentActivityRowItem(
                             icon = Icons.Default.WaterDrop,
-                            iconBgColor = Color(0xFF1D4ED8),
-                            iconTint = Color(0xFF93C5FD),
+                            iconBgColor = SkySoft,
+                            iconTint = SkyAccent,
                             titleAr = "تم إكمال الري ($waterM3Text م³/فدان)",
                             subtitleAr = "${uiState.fieldName} • اليوم، 8:30 ص",
                             statusAr = "مكتمل",
@@ -1587,7 +1752,7 @@ private fun FieldDetailStreamlinedView(
                         RecentActivityRowItem(
                             icon = Icons.Default.Eco,
                             iconBgColor = LimeSoftBg,
-                            iconTint = LimeBright,
+                            iconTint = EmeraldPrimary,
                             titleAr = "تطبيق التسميد ومعادلة الحموضة",
                             subtitleAr = "${uiState.fieldName} • حقن ${formatDecimal1(uiState.epidemiologyReport.acidDoseLitersPerFeddan)} لتر حامض/فدان",
                             statusAr = "مكتمل",
@@ -1601,8 +1766,8 @@ private fun FieldDetailStreamlinedView(
 
                         RecentActivityRowItem(
                             icon = Icons.Default.Radar,
-                            iconBgColor = Color(0xFF422006),
-                            iconTint = AmberLight,
+                            iconBgColor = AmberSoft,
+                            iconTint = AmberWarning,
                             titleAr = "مسح القمر الصناعي Sentinel-2",
                             subtitleAr = "${uiState.fieldName} • ${uiState.epidemiologyReport.detectedRiskNameAr}",
                             statusAr = "مكتمل",
@@ -1925,7 +2090,7 @@ private fun FieldHealthIndexWaveCard(
                 // Right side: Smooth Green Bezier Wave Chart (1..8..15..22..29)
                 Column(
                     modifier = Modifier.weight(1.3f),
-                    horizontalAlignment = Alignment.End
+                    horizontalAlignment = Alignment.Start
                 ) {
                     Box(
                         modifier = Modifier
@@ -2083,3 +2248,252 @@ private fun RecentActivityRowItem(
         }
     }
 }
+
+@Composable
+private fun OfflineRoomTelemetryCacheCard(
+    uiState: AgroSightUiState,
+    onCacheCurrentToRoom: () -> Unit,
+    onRestoreFromRoomCache: () -> Unit,
+    onClearRoomCache: () -> Unit
+) {
+    val activeCachedWeather = uiState.cachedWeatherForecasts.firstOrNull { it.fieldId == uiState.fieldId }
+        ?: uiState.cachedWeatherForecasts.firstOrNull()
+    val activeCachedSat = uiState.cachedSatelliteAnalyses.firstOrNull { it.fieldId == uiState.fieldId }
+        ?: uiState.cachedSatelliteAnalyses.firstOrNull()
+
+    val isServingCached = uiState.isServingFromRoomOfflineCache
+    val statusBadgeText = when {
+        isServingCached -> "وضع بدون إنترنت • Room SQLite Cache"
+        uiState.isLiveMeteoConnected -> "متصل • نسخ احتياطي تلقائي في Room"
+        else -> "جاهز للعمل بدون إنترنت (Room SQLite)"
+    }
+    val statusBadgeColor = when {
+        isServingCached -> SkyAccent
+        uiState.isLiveMeteoConnected -> EmeraldPrimary
+        else -> AmberWarning
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("room_offline_cache_card"),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(containerColor = ForestCardDark),
+        border = BorderStroke(1.dp, ForestCardBorder),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(EmeraldPrimary.copy(alpha = 0.14f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Cloud,
+                            contentDescription = "Room Offline Cache",
+                            tint = EmeraldPrimary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    Column {
+                        Text(
+                            text = "التخزين المحلي بدون إنترنت (Room SQLite Cache)",
+                            color = MintTextPrimary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            text = uiState.roomOfflineCacheStatusAr,
+                            color = MintTextSoft,
+                            fontSize = 11.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                Surface(
+                    color = statusBadgeColor.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(50),
+                    border = BorderStroke(1.dp, statusBadgeColor.copy(alpha = 0.45f))
+                ) {
+                    Text(
+                        text = statusBadgeText,
+                        color = statusBadgeColor,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // Cached Satellite Analysis Summary Box
+                Surface(
+                    modifier = Modifier.weight(1f),
+                    color = ForestBgMid,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, ForestCardBorder)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "تحليل القمر الصناعي المخزن",
+                            color = SkyAccent,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (activeCachedSat != null) {
+                                "NDVI ${formatDecimal2(activeCachedSat.ndviMean)} • NDRE ${formatDecimal2(activeCachedSat.ndreMean)}"
+                            } else {
+                                "NDVI ${formatDecimal2(uiState.epidemiologyReport.ndviMean)} • NDRE ${formatDecimal2(uiState.epidemiologyReport.ndreMean)}"
+                            },
+                            color = MintTextPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            text = activeCachedSat?.let {
+                                "المشهد: ${it.sceneId.take(18)} (${it.cachedSatelliteCountText(uiState.cachedSatelliteAnalyses.size)})"
+                            } ?: "الحقول المخزنة: ${uiState.cachedSatelliteAnalyses.size}",
+                            color = MintTextSoft,
+                            fontSize = 10.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                // Cached Weather Data Summary Box
+                Surface(
+                    modifier = Modifier.weight(1f),
+                    color = ForestBgMid,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, ForestCardBorder)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "بيانات الأرصاد المخزنة (7 أيام)",
+                            color = EmeraldPrimary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (activeCachedWeather != null) {
+                                "${activeCachedWeather.todayTempMaxC.roundToInt()}°C • ET₀ ${formatDecimal2(activeCachedWeather.todayEt0MmDay)} مم"
+                            } else {
+                                val todayRec = uiState.forecastDays.firstOrNull()
+                                "${(todayRec?.tempMaxC ?: 31f).roundToInt()}°C • ET₀ ${formatDecimal2(todayRec?.et0MmDay ?: 5.4f)} مم"
+                            },
+                            color = MintTextPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            text = activeCachedWeather?.let {
+                                "آخر حفظ: ${it.cachedAtIso.takeLast(8)} (${uiState.cachedWeatherForecasts.size} سجل)"
+                            } ?: "السجلات المخزنة: ${uiState.cachedWeatherForecasts.size}",
+                            color = MintTextSoft,
+                            fontSize = 10.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onCacheCurrentToRoom,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = EmeraldPrimary,
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("room_cache_save_button")
+                ) {
+                    Text(
+                        text = "حفظ للعمل بدون إنترنت",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Button(
+                    onClick = onRestoreFromRoomCache,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SkySoft,
+                        contentColor = SkyAccent
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("room_cache_restore_button")
+                ) {
+                    Text(
+                        text = "استعادة من Room",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                if (uiState.cachedWeatherForecasts.isNotEmpty() || uiState.cachedSatelliteAnalyses.isNotEmpty()) {
+                    Surface(
+                        color = ForestBgMid,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, ForestCardBorder),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable(onClick = onClearRoomCache)
+                            .testTag("room_cache_clear_button")
+                    ) {
+                        Text(
+                            text = "مسح",
+                            color = MintTextSoft,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun com.example.data.CachedSatelliteAnalysisEntity.cachedSatelliteCountText(total: Int): String =
+    "$total حقل"
+

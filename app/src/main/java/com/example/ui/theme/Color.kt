@@ -2,50 +2,81 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// Primary Brand: Deep Agri-Emerald
-val EmeraldPrimary = Color(0xFF059669)
-val EmeraldLight = Color(0xFF10B981)
-val EmeraldSoft = Color(0xFFD1FAE5)
-val EmeraldDark = Color(0xFF064E3B)
+// ============================================================================
+// AGROSIGHT OFFICIAL LOGO PALETTE
+// Extracted directly from the AgroSight brand mark ("agrosight —
+// PRECISION AGRI-INSIGHTS FROM ABOVE"):
+//   • Warm Ivory Canvas:         #FCFBF7 / #F4F3ED
+//   • Primary Botanical Green:   #1E6744 / #1C5B40 / #287A52
+//   • Soft Botanical Sage:       #D3E7E0 / #EAF3EE
+//   • Secondary Pixel Blue:      #198AC7 / #308DC2 / #E1F2FA
+//   • Subtitle Charcoal & Sage:  #1A3326 / #57685D / #668975
+// ============================================================================
 
-// Water & Meteorology Accent: Sky/Cyan
-val SkyAccent = Color(0xFF0284C7)
-val CyanLight = Color(0xFF38BDF8)
-val SkySoft = Color(0xFFE0F2FE)
+// Official AgroSight Brand Constants
+val AgroSightIvory = Color(0xFFFCFBF7)
+val AgroSightIvoryDeep = Color(0xFFF4F3ED)
+val AgroSightBotanicalGreen = Color(0xFF1E6744)
+val AgroSightBotanicalDark = Color(0xFF1C5B40)
+val AgroSightBotanicalLight = Color(0xFF287A52)
+val AgroSightBotanicalSage = Color(0xFFD3E7E0)
+val AgroSightPixelBlue = Color(0xFF198AC7)
+val AgroSightPixelBlueBright = Color(0xFF308DC2)
+val AgroSightPixelBlueSoft = Color(0xFFE1F2FA)
+val AgroSightCharcoalInk = Color(0xFF1A3326)
+val AgroSightSubtitleSage = Color(0xFF57685D)
+val AgroSightMutedSage = Color(0xFF668975)
 
-// Soil & Alkalinity Warnings: Amber & Rose
+// Primary Brand Botanical Greens (Leaf Outline & "agrosight" Wordmark)
+val EmeraldPrimary = AgroSightBotanicalGreen
+val EmeraldLight = AgroSightBotanicalLight
+val EmeraldSoft = AgroSightBotanicalSage
+val EmeraldDark = AgroSightBotanicalDark
+
+// Secondary Brand Satellite Data Pixel Blues (Data Squares Inside the Leaf)
+val SkyAccent = AgroSightPixelBlue
+val CyanLight = AgroSightPixelBlueBright
+val SkySoft = AgroSightPixelBlueSoft
+
+// Semantic Agronomic Alert Accents (Harmonized for Warm Ivory & Sage Surfaces)
 val AmberWarning = Color(0xFFD97706)
-val AmberLight = Color(0xFFF59E0B)
+val AmberLight = Color(0xFFD97706)
 val AmberSoft = Color(0xFFFEF3C7)
 
-val RoseDanger = Color(0xFFE11D48)
-val RoseLight = Color(0xFFF43F5E)
-val RoseSoft = Color(0xFFFFE4E6)
+val RoseDanger = Color(0xFFDC2626)
+val RoseLight = Color(0xFFDC2626)
+val RoseSoft = Color(0xFFFEE2E2)
 
-// Dark Slate Sidebar & Header
-val Slate950 = Color(0xFF020617)
-val Slate900 = Color(0xFF0F172A)
-val Slate800 = Color(0xFF1E293B)
-val Slate700 = Color(0xFF334155)
-val Slate600 = Color(0xFF475569)
-val Slate500 = Color(0xFF64748B)
-val Slate400 = Color(0xFF94A3B8)
-val Slate200 = Color(0xFFE2E8F0)
-val Slate100 = Color(0xFFF1F5F9)
-val Slate50 = Color(0xFFF8FAFC)
+val PurpleScience = AgroSightPixelBlue
+val PurpleSoft = AgroSightPixelBlueSoft
 
-// Streamlined Forest-Green Agritech Palette (Reference UI Theme)
-val ForestBgDeep = Color(0xFF07170D)
-val ForestBgDark = Color(0xFF0B2214)
-val ForestBgMid = Color(0xFF102E1B)
-val ForestCardDark = Color(0xFF153721)
-val ForestCardElevated = Color(0xFF1C462B)
-val ForestCardGlass = Color(0xFF215132)
-val ForestCardBorder = Color(0xFF2D6641)
-val LimeAccent = Color(0xFF6DBE45)
-val LimeBright = Color(0xFF84D859)
-val LimeSoftBg = Color(0xFF234D2C)
-val MintTextPrimary = Color(0xFFF2FBF5)
-val MintTextSoft = Color(0xFFA9D6B7)
-val MintTextMuted = Color(0xFF75A886)
+// Botanical Ink, Subtitle Charcoal & Warm Ivory Surface Scale
+val Slate950 = Color(0xFF132D20)
+val Slate900 = Color(0xFF1C4632)
+val Slate800 = Color(0xFF23563E)
+val Slate700 = Color(0xFF35684F)
+val Slate600 = AgroSightSubtitleSage
+val Slate500 = AgroSightMutedSage
+val Slate400 = Color(0xFF88A494)
+val Slate200 = AgroSightBotanicalSage
+val Slate100 = Color(0xFFF3F6F3)
+val Slate50 = AgroSightIvory
 
+// Dashboard & Navigation Surface Tokens (Mapped to AgroSight Logo Palette)
+val ForestBgDeep = AgroSightIvoryDeep
+val ForestBgDark = AgroSightIvory
+val ForestBgMid = Color(0xFFEFF5F1)
+val ForestCardDark = Color(0xFFFFFFFF)
+val ForestCardElevated = Color(0xFFEAF3EE)
+val ForestCardGlass = AgroSightBotanicalSage
+val ForestCardBorder = Color(0xFFC3DDD1)
+
+// Logo Primary Botanical Green & Soft Sage Highlights
+val LimeAccent = AgroSightBotanicalGreen
+val LimeBright = AgroSightBotanicalGreen
+val LimeSoftBg = AgroSightBotanicalSage
+
+// High-Contrast Botanical Ink & Subtitle Sage Typography
+val MintTextPrimary = AgroSightCharcoalInk
+val MintTextSoft = Color(0xFF4F6458)
+val MintTextMuted = AgroSightMutedSage

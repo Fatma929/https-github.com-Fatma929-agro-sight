@@ -15,7 +15,14 @@
 -keepclassmembers enum com.example.model.** { *; }
 -keepclassmembers enum com.example.data.** { *; }
 
+# Keep ViewModels and their Application constructors for ViewModelProvider reflection
+-keep class com.example.viewmodel.** { *; }
+-keepclassmembers class * extends androidx.lifecycle.AndroidViewModel {
+    public <init>(android.app.Application);
+}
+
 # Silence benign warnings from OkHttp / Conscrypt / Kotlin Coroutines
 -dontwarn org.conscrypt.**
 -dontwarn org.bouncycastle.**
 -dontwarn org.openjsse.**
+

@@ -1,6 +1,10 @@
+@file:SuppressLint("NewApi")
+
 package com.example.data
 
+import android.annotation.SuppressLint
 import android.content.Context
+import androidx.core.content.edit
 import com.example.model.AccountStatus
 import com.example.model.SystemAuditEvent
 import com.example.model.SystemWideAnalyticsSummary
@@ -1350,7 +1354,7 @@ class DatabaseService(context: Context? = null) {
         }
         root.put("whatsappMessages", msgsArr)
 
-        p.edit().putString("db_json_v1", root.toString()).apply()
+        p.edit { putString("db_json_v1", root.toString()) }
     }
 
     private fun loadFromPersistence(): Boolean {
